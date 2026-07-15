@@ -1,0 +1,170 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum Role {
+  OWNER
+  ADMIN
+  MEMBER
+}
+
+model Workspace {
+  id          String       @id @default(cuid())
+  name        String
+  slug        String       @unique
+  settings    Json
+  createdAt   DateTime     @default(now())
+  users       User[]
+  leads       Lead[]
+  credentials Credential[]
+  apiKeys     ApiKey[]
+  auditLogs   AuditLog[]
+}
+
+model User {
+  id            String         @id @default(cuid())
+  workspaceId   String
+  workspace     Workspace      @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  email         String         @unique
+  passwordHash  String
+  name          String
+  role          Role           @default(MEMBER)
+  lastLoginAt   DateTime?
+  createdAt     DateTime       @default(now())
+  refreshTokens RefreshToken[]
+  ownedLeads    Lead[]         @relation("LeadOwner")
+
+  @@index([workspaceId])
+}
+
+model RefreshToken {
+  id        String    @id @default(cuid())
+  userId    String
+  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  tokenHash String    @unique
+  expiresAt DateTime
+  revokedAt DateTime?
+  createdAt DateTime  @default(now())
+
+  @@index([userId])
+}
+
+model Lead {
+  id                       String          @id @default(cuid())
+  workspaceId              String
+  workspace                Workspace       @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  externalId               String?
+  receivedAt               DateTime
+  name                     String
+  email                    String
+  org                      String          @default("")
+  source                   String
+  inquiryType              String
+  summary                  String          @default("")
+  fitScore                 Int
+  urgencyScore             Int
+  leadScore                Int
+  tier                     String
+  dealValueLow             Float           @default(0)
+  dealValueHigh            Float           @default(0)
+  estPayoutRaw             String          @default("")
+  winProbability           Float
+  winProbabilityOverridden Boolean         @default(false)
+  expectedValue            Float
+  estWork                  String          @default("")
+  recommendedNextStep      String          @default("")
+  draftReply               String          @default("")
+  fitReasons               Json            @default("[]")
+  riskFlags                Json            @default("[]")
+  inferredFields           Json            @default("[]")
+  stage                    String          @default("New")
+  ownerId                  String?
+  owner                    User?           @relation("LeadOwner", fields: [ownerId], references: [id], onDelete: SetNull)
+  followUpDate             DateTime?
+  replySent                Boolean         @default(false)
+  lastTouchedAt            DateTime        @default(now())
+  notes                    String          @default("")
+  deletedAt                DateTime?
+  createdAt                DateTime        @default(now())
+  updatedAt                DateTime        @updatedAt
+  threads                  Thread[]
+  timeline                 TimelineEvent[]
+
+  @@unique([workspaceId, externalId])
+  @@index([workspaceId])
+  @@index([workspaceId, stage])
+  @@index([workspaceId, leadScore])
+  @@index([workspaceId, followUpDate])
+  @@index([workspaceId, receivedAt])
+}
+
+model Thread {
+  id        String   @id @default(cuid())
+  leadId    String
+  lead      Lead     @relation(fields: [leadId], references: [id], onDelete: Cascade)
+  subject   String
+  url       String
+  direction String
+  date      DateTime
+  snippet   String
+
+  @@index([leadId])
+}
+
+model TimelineEvent {
+  id     String   @id @default(cuid())
+  leadId String
+  lead   Lead     @relation(fields: [leadId], references: [id], onDelete: Cascade)
+  type   String
+  at     DateTime @default(now())
+  actor  String
+  detail String
+
+  @@index([leadId])
+}
+
+model Credential {
+  id             String    @id @default(cuid())
+  workspaceId    String
+  workspace      Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  kind           String
+  encryptedValue String
+  meta           Json      @default("{}")
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
+
+  @@unique([workspaceId, kind])
+}
+
+model ApiKey {
+  id          String    @id @default(cuid())
+  workspaceId String
+  workspace   Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  name        String
+  prefix      String
+  keyHash     String    @unique
+  scopes      Json      @default("[\"ingest\"]")
+  lastUsedAt  DateTime?
+  revokedAt   DateTime?
+  createdAt   DateTime  @default(now())
+
+  @@index([workspaceId])
+}
+
+model AuditLog {
+  id          String    @id @default(cuid())
+  workspaceId String
+  workspace   Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  userId      String?
+  action      String
+  target      String
+  ip          String?
+  at          DateTime  @default(now())
+
+  @@index([workspaceId, at])
+}

@@ -1,0 +1,5 @@
+# Automatic HTTPS for {$LEADLINE_DOMAIN} (Let's Encrypt).
+{$LEADLINE_DOMAIN} {
+	encode gzip
+	reverse_proxy api:8080
+}
