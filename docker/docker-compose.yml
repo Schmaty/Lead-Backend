@@ -1,0 +1,100 @@
+name: leadline
+
+services:
+  api:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    restart: unless-stopped
+    env_file:
+      - ../.env
+    environment:
+      # Always talk to the bundled db service, regardless of the .env value
+      # (which points at localhost for local development).
+      DATABASE_URL: postgresql://leadline:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}@db:5432/leadline
+      HOST: 0.0.0.0
+      PORT: "8080"
+    depends_on:
+      db:
+        condition: service_healthy
+    # Bound to localhost only — the edge profile (Caddy or Cloudflare Tunnel)
+    # is the sole public entry point.
+    ports:
+      - "127.0.0.1:8080:8080"
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:8080/health').then(r=>process.exit(r.status===200?0:1)).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: leadline
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: leadline
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    # Uncomment to reach Postgres from the host (e.g. to run the demo seed or
+    # ad-hoc maintenance), then `docker compose up -d db`. Re-comment after.
+    # ports:
+    #   - "127.0.0.1:5433:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U leadline -d leadline"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+
+  # Public HTTPS via your own domain (requires ports 80/443 reachable).
+  edge-caddy:
+    profiles: ["domain"]
+    image: caddy:2
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      LEADLINE_DOMAIN: ${LEADLINE_DOMAIN:?set LEADLINE_DOMAIN in .env}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - api
+
+  # Public HTTPS via Cloudflare Tunnel — recommended for home hosting:
+  # no port-forwarding, no exposed inbound ports.
+  edge-tunnel:
+    profiles: ["home"]
+    image: cloudflare/cloudflared:latest
+    restart: unless-stopped
+    command: tunnel --no-autoupdate run --token ${CLOUDFLARE_TUNNEL_TOKEN:?set CLOUDFLARE_TUNNEL_TOKEN in .env}
+    depends_on:
+      - api
+
+  # Nightly encrypted pg_dump into the backups volume.
+  backup:
+    build: ./backup
+    restart: unless-stopped
+    environment:
+      PGHOST: db
+      PGPORT: "5432"
+      PGUSER: leadline
+      PGPASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      PGDATABASE: leadline
+      BACKUP_ENCRYPTION_KEY: ${BACKUP_ENCRYPTION_KEY:?set BACKUP_ENCRYPTION_KEY in .env}
+      BACKUP_RETENTION_DAYS: ${BACKUP_RETENTION_DAYS:-14}
+      BACKUP_CRON: ${BACKUP_CRON:-15 2 * * *}
+    volumes:
+      - backups:/backups
+    depends_on:
+      db:
+        condition: service_healthy
+
+volumes:
+  pgdata:
+  caddy_data:
+  caddy_config:
+  backups:

@@ -1,0 +1,18 @@
+# OPTIONAL: only needed if you prefer a credentials-file tunnel over the
+# token-based one used by docker-compose.yml (profile "home").
+#
+# With the token approach (recommended, zero files):
+#   1. Cloudflare Zero Trust dashboard → Networks → Tunnels → Create a tunnel
+#   2. Public hostname: api.yourdomain.com → Service: http://api:8080
+#   3. Copy the token into CLOUDFLARE_TUNNEL_TOKEN in .env
+#
+# With this file instead: mount it plus the tunnel credentials JSON into the
+# cloudflared container and change the service command to
+#   tunnel --no-autoupdate --config /etc/cloudflared/config.yml run
+tunnel: <TUNNEL_UUID>
+credentials-file: /etc/cloudflared/<TUNNEL_UUID>.json
+
+ingress:
+  - hostname: api.yourdomain.com
+    service: http://api:8080
+  - service: http_status:404

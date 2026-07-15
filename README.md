@@ -1,1 +1,383 @@
-# Lead-Backend
+# Leadline API
+
+Self-hosted, multi-tenant backend for the Leadline lead-management product. It stores, secures and serves the leads that an n8n + Anthropic pipeline scores from Gmail, and exposes the REST API the Leadline dashboard consumes.
+
+```
+┌────────┐   ┌──────────────────────┐   ┌─────────────────────────┐   ┌────────────────────┐
+│ Gmail  │ → │ n8n + Anthropic      │ → │ Leadline API + Postgres │ → │ Leadline dashboard │
+│        │   │ (ingests & scores)   │   │ (stores, secures,       │   │ (team reads /      │
+│        │   │ POST /ingest/leads   │   │  serves — this repo)    │   │  triages / edits)  │
+└────────┘   └──────────────────────┘   └─────────────────────────┘   └────────────────────┘
+```
+
+- **Multi-tenant:** every business row belongs to a `Workspace`; every query is workspace-scoped. One deployment can serve multiple client businesses with isolated data.
+- **Store-and-serve only:** no AI scoring happens here (that stays in n8n). No billing, no websockets — a clean, secure v1.
+- **Portable by design:** Docker + config-only. Moving from the home server to a cloud VM later requires no code changes (see [Cloud migration](#cloud-migration-checklist)).
+
+**Stack:** Node.js 20 · TypeScript · Fastify 5 · Prisma 6 · PostgreSQL 16 · Docker Compose · Caddy or Cloudflare Tunnel at the edge.
+
+---
+
+## API reference
+
+Base path: `/api/v1`. All responses are JSON in camelCase. This section is a summary — the **complete field-level reference** (every endpoint, request/response shape, filter, analytics metric, error code, and the frontend auth flow) is in [docs/API.md](docs/API.md).
+
+### Auth model
+
+- `POST /auth/login` (or signup) returns a short-lived **access token** (default 15 m) and sets a **rotating refresh token** in an `httpOnly` cookie (`leadline_refresh`, scoped to `/api/v1/auth`, `Secure` in production, `SameSite=lax` by default).
+- The SPA sends `Authorization: Bearer <accessToken>` on every call and renews via `POST /auth/refresh` **with credentials** (the cookie).
+- Refresh tokens rotate on every use. Presenting an already-rotated token is treated as theft: **all** of that user's sessions are revoked and the event is audited.
+- Passwords are argon2id. Refresh tokens and API keys are stored only as SHA-256 hashes.
+
+### Endpoints
+
+| Area | Endpoint | Notes |
+|---|---|---|
+| Health | `GET /health`, `GET /ready` | liveness / DB reachability (root path, no `/api/v1`) |
+| Auth | `POST /api/v1/auth/signup` | `{workspaceName, name, email, password}` → new workspace + OWNER |
+| | `POST /api/v1/auth/login` · `POST /auth/refresh` · `POST /auth/logout` · `GET /auth/me` | |
+| | `POST /api/v1/auth/invite` | OWNER/ADMIN; `{email, role: ADMIN\|MEMBER}` → invite link (emailed if SMTP configured) |
+| | `POST /api/v1/auth/accept-invite` | `{token, name, password}` |
+| | `POST /api/v1/auth/password/change` · `…/password/reset-request` · `…/password/reset` | reset-request always returns 200 (no user enumeration) |
+| Workspace | `GET /api/v1/workspace` · `GET /workspace/users` | settings + members |
+| | `PATCH /api/v1/workspace/settings` | OWNER/ADMIN; changing `tierThresholds`/`winProbabilityMap` recomputes all leads |
+| | `GET/PUT/DELETE /api/v1/workspace/credentials[/:kind]` | OWNER/ADMIN; kinds: `ANTHROPIC_API_KEY`, `GMAIL_OAUTH`, `N8N_WEBHOOK`, `GOOGLE_SHEET`; stored AES-256-GCM-encrypted, returned **masked only** |
+| | `GET/POST /api/v1/workspace/api-keys` · `DELETE /workspace/api-keys/:id` | OWNER/ADMIN; the full key is returned **exactly once** at creation |
+| Leads | `GET /api/v1/leads` | filters/sort/search/pagination + `aggregates` (see below) |
+| | `GET /api/v1/leads/export.csv` | same filters, CSV download |
+| | `GET /api/v1/leads/:id` | full record incl. `threads`, `timeline`, `timeInStageHours` |
+| | `POST /api/v1/leads` | manual add; computes tier/winProbability/expectedValue |
+| | `PATCH /api/v1/leads/:id` | **safe fields only** (see below) |
+| | `DELETE /api/v1/leads/:id` | OWNER/ADMIN; soft delete; audited |
+| Analytics | `GET /api/v1/analytics?from&to` | funnel, win rate, won value, weekly trends, first-response time, source performance, score calibration |
+| Ingest | `POST /api/v1/ingest/leads` | **`x-api-key` auth (not user auth)**; idempotent upsert by `externalId` |
+
+### Lead list filters (`GET /leads`)
+
+`stage`, `tier`, `inquiryType`, `source`, `ownerId` (all multi-value: repeat the param or comma-separate; `ownerId` accepts the literal `unassigned`) · `fitMin`/`fitMax`, `urgencyMin`/`urgencyMax`, `leadMin`/`leadMax` (0–10) · `receivedFrom`/`receivedTo`, `followUpFrom`/`followUpTo` (ISO dates) · `overdue=true` (past follow-up on a non-closed stage) · `expectedMin`/`expectedMax` · `replySent` · `needsAttention=true` (hot **or** overdue **or** unassigned-and-received-within-7-days) · `search` (name/org/email/summary/notes, case-insensitive) · `sort` (`receivedAt`, `leadScore`, `fitScore`, `urgencyScore`, `expectedValue`, `winProbability`, `followUpDate`, `name`, `org`, `stage`, `lastTouchedAt`, `createdAt`) · `order` (`asc`/`desc`) · `page`, `pageSize` (max 200).
+
+Response: `{ items, page, pageSize, total, aggregates }` where `aggregates` — computed under the **same filters** — contains `countByStage`, `countByTier`, `pipelineExpectedValue` (open stages only), `wonCount`, `wonValue`, `overdueCount`, `unassignedCount`, `needsAttentionCount`, `total`.
+
+### PATCH safe fields
+
+`PATCH /leads/:id` accepts **only**: `stage`, `ownerId` (user id or `null`/`"unassigned"`), `followUpDate`, `notes`, `replySent`, `winProbability`. Anything else — AI-scored or computed fields — is rejected with `400` and the offending field names listed. Each change appends the matching timeline event (`stage_change`, `owner_change`, `follow_up_set`, `note_added`, `reply_sent`, `win_probability_set`) and bumps `lastTouchedAt`.
+
+> **Design note:** `winProbability` is deliberately the one human-overridable computed field (the data model calls it "human-overridable"). Patching it sets an override flag, recomputes `expectedValue`, and the override **survives re-ingestion** and settings recomputes.
+
+---
+
+## Prerequisites
+
+A Linux server (home box or VM) with Docker Engine + the compose plugin:
+
+```bash
+curl -fsSL https://get.docker.com | sh
+sudo usermod -aG docker $USER   # log out/in afterwards
+docker compose version           # v2.20+ required (compose "include")
+```
+
+Clone this repo onto the server.
+
+## Generating secrets
+
+```bash
+cp .env.example .env
+# 32-byte key for AES-256-GCM secret encryption:
+openssl rand -base64 32    # → APP_ENCRYPTION_KEY
+# JWT signing secrets (MUST be different from each other):
+openssl rand -base64 48    # → JWT_ACCESS_SECRET
+openssl rand -base64 48    # → JWT_REFRESH_SECRET
+# Backup encryption passphrase:
+openssl rand -base64 32    # → BACKUP_ENCRYPTION_KEY
+# And a strong POSTGRES_PASSWORD of your choosing.
+```
+
+Fill them into `.env`. Every variable is documented inline in [.env.example](.env.example). **Never commit `.env`** (it's gitignored). The server validates configuration at boot and refuses to start with missing or weak values.
+
+## At-rest encryption — three layers
+
+| Layer | What | How |
+|---|---|---|
+| 1. Application | Integration secrets (`Credential` rows: Anthropic key, Gmail OAuth, n8n webhook secret, Sheet id) | AES-256-GCM with `APP_ENCRYPTION_KEY`; API returns masked values only (`sk-…1234`) |
+| 2. Disk | Everything in Postgres (incl. lead PII) | **Full-disk encryption (LUKS) on the host partition** holding `/var/lib/docker/volumes` — an operator step, since Postgres has no free built-in TDE. Easiest at OS install time (choose encrypted LVM); retrofitting: `cryptsetup luksFormat` on a dedicated data partition, then move the Docker data root onto it. |
+| 3. Backups | Nightly dumps | `pg_dump \| gzip \| gpg --symmetric` (AES-256) with `BACKUP_ENCRYPTION_KEY` |
+
+Passwords: argon2id. API keys and refresh tokens: SHA-256 hashes only — the raw values are never stored and never logged (secrets are redacted from logs).
+
+**Key rotation** (`APP_ENCRYPTION_KEY`): decrypt with the old key, re-encrypt with the new. One-off script pattern:
+
+```bash
+OLD_KEY=<old> NEW_KEY=<new> npx tsx -e "
+import { PrismaClient } from '@prisma/client'
+import { decryptSecret, encryptSecret } from './src/crypto/secrets.js'
+const prisma = new PrismaClient()
+const oldKey = Buffer.from(process.env.OLD_KEY!, 'base64')
+const newKey = Buffer.from(process.env.NEW_KEY!, 'base64')
+for (const c of await prisma.credential.findMany()) {
+  await prisma.credential.update({ where: { id: c.id },
+    data: { encryptedValue: encryptSecret(decryptSecret(c.encryptedValue, oldKey), newKey) } })
+}
+await prisma.\$disconnect(); console.log('rotated')
+"
+# then set APP_ENCRYPTION_KEY=<new> in .env and restart the api
+```
+
+**Column-level PII encryption** (lead names/emails) is deliberately **off**: it would break server-side search and sort on those columns. Disk encryption (layer 2) covers PII at rest for this deployment model.
+
+## First run
+
+```bash
+# api + db + nightly backups, API reachable on 127.0.0.1:8080 only:
+docker compose up -d --build
+
+# home hosting (recommended): adds the Cloudflare Tunnel
+docker compose --profile home up -d --build
+
+# or with your own domain + open port 443: adds Caddy (auto-HTTPS)
+docker compose --profile domain up -d --build
+```
+
+Database migrations run automatically when the `api` container starts (`prisma migrate deploy` in the entrypoint). Check:
+
+```bash
+docker compose ps
+curl -s http://127.0.0.1:8080/health   # {"status":"ok"}
+curl -s http://127.0.0.1:8080/ready    # {"status":"ready"}
+```
+
+### Optional: load the demo workspace
+
+The seed creates the fictional **"Fieldstone Training Group"** workspace (3 users, 34 leads across all stages) so the dashboard demos end-to-end. It needs Node on the machine running it and a network path to Postgres. On the server:
+
+```bash
+# 1. uncomment the db "ports: 127.0.0.1:5433:5432" lines in docker/docker-compose.yml
+docker compose up -d db
+# 2. from this repo:
+npm ci
+DATABASE_URL="postgresql://leadline:$POSTGRES_PASSWORD@127.0.0.1:5433/leadline" npm run seed
+# 3. re-comment the port mapping and `docker compose up -d db` again
+```
+
+The seed is idempotent (re-running updates instead of duplicating) and prints the demo login credentials when done.
+
+## Create the first workspace + ingest API key
+
+```bash
+API=http://127.0.0.1:8080   # or your public URL later
+
+# 1. Signup — creates YOUR workspace and its OWNER account
+curl -s $API/api/v1/auth/signup -H 'content-type: application/json' -d '{
+  "workspaceName": "Fieldstone Training Group",
+  "name": "Avery Fieldstone",
+  "email": "you@yourdomain.com",
+  "password": "a-long-unique-passphrase"
+}'
+
+# 2. Login → grab the accessToken from the response
+TOKEN=$(curl -s $API/api/v1/auth/login -H 'content-type: application/json' \
+  -d '{"email":"you@yourdomain.com","password":"a-long-unique-passphrase"}' | jq -r .accessToken)
+
+# 3. Create the ingest API key for n8n — the full key is shown ONLY ONCE
+curl -s $API/api/v1/workspace/api-keys -H "authorization: Bearer $TOKEN" \
+  -H 'content-type: application/json' -d '{"name":"n8n production"}'
+# → { "id": "…", "prefix": "llk_AbCd", "key": "llk_…FULL KEY…", "warning": "…" }
+
+# 4. Test the ingest webhook with that key
+curl -s $API/api/v1/ingest/leads -H 'x-api-key: llk_…' -H 'content-type: application/json' -d '{
+  "externalId": "thread_abc123",
+  "receivedAt": "2026-07-06T14:12:00Z",
+  "name": "Dana Okafor",
+  "email": "dana.okafor@northwindlogistics.com",
+  "org": "Northwind Logistics",
+  "source": "Email",
+  "inquiryType": "New project / hot lead",
+  "summary": "40-seat training request",
+  "fitScore": 9, "urgencyScore": 8, "leadScore": 9,
+  "dealValueLow": 6000, "dealValueHigh": 12000,
+  "estPayoutRaw": "$6,000–12,000 — 40-seat + exec, clear budget",
+  "estWork": "~20–30 hrs delivery",
+  "recommendedNextStep": "Offer a 20-min scoping call this week.",
+  "draftReply": "Hi Dana, …",
+  "fitReasons": ["Decision-maker (VP)","Budget allocated"],
+  "riskFlags": ["Exact dates unconfirmed"],
+  "inferredFields": ["dealValueLow","dealValueHigh"],
+  "threads": [{ "subject":"AI training for our team",
+    "url":"https://mail.google.com/mail/u/0/#all/abc123",
+    "direction":"in", "date":"2026-07-06T14:12:00Z", "snippet":"…" }]
+}'
+# → { "id": "…", "created": true }   — POST the same externalId again: { "created": false }, still one row
+```
+
+## Expose it
+
+### Option A — Cloudflare Tunnel (recommended for home hosting)
+
+No port-forwarding, no static IP, no exposed inbound ports, free TLS + basic DDoS protection.
+
+1. Cloudflare dashboard → **Zero Trust → Networks → Tunnels → Create a tunnel** (Cloudflared connector).
+2. Copy the tunnel **token** into `CLOUDFLARE_TUNNEL_TOKEN` in `.env`.
+3. Add a **Public hostname**: `api.yourdomain.com` → service `http://api:8080`.
+4. `docker compose --profile home up -d`
+
+### Option B — Caddy + your own domain
+
+Requires a domain pointed at your IP (use DDNS if dynamic) and **only port 443/80 forwarded** to the server.
+
+1. Set `LEADLINE_DOMAIN=api.yourdomain.com` in `.env`.
+2. `docker compose --profile domain up -d` — Caddy provisions Let's Encrypt certificates automatically.
+
+Either way, the API container itself is bound to `127.0.0.1:8080` — the edge is the only public entry point, and all public traffic is TLS.
+
+## Point n8n at it
+
+In the existing n8n workflow, replace the final **Append to Google Sheet** node with an **HTTP Request** node:
+
+- **Method:** POST · **URL:** `https://api.yourdomain.com/api/v1/ingest/leads`
+- **Authentication:** Header Auth credential — name `x-api-key`, value = the ingest key from above.
+- **Body:** JSON, mapped from the "Finalize Row" fields to the camelCase payload shown in the curl above.
+- n8n retries and workflow re-runs are safe: the upsert by `externalId` never duplicates.
+- Keep the Sheets append as a parallel branch only if a per-client spreadsheet mirror is still wanted.
+
+**Optional HMAC hardening:** set `INGEST_HMAC_ENABLED=true` in `.env`, store a shared secret via `PUT /api/v1/workspace/credentials/N8N_WEBHOOK` (`{"value":"<random secret>"}`), and have n8n send `x-signature` = hex HMAC-SHA256 of the raw JSON body with that secret. Once the secret exists, unsigned or mis-signed requests are rejected.
+
+## Point the dashboard at it
+
+Set `CORS_ORIGIN` in `.env` to the dashboard's exact origin (e.g. `https://leadline.yourdomain.com`) — the allow-list is enforced with credentials. Then swap the dashboard's `dataService` seed adapter for HTTP:
+
+```ts
+// apiDataService.ts — drop-in replacement for the seed-data adapter
+const BASE = import.meta.env.VITE_API_URL ?? 'https://api.yourdomain.com'
+let accessToken: string | null = null
+
+async function request<T>(path: string, init: RequestInit = {}, retry = true): Promise<T> {
+  const res = await fetch(`${BASE}/api/v1${path}`, {
+    ...init,
+    credentials: 'include', // refresh cookie
+    headers: {
+      'content-type': 'application/json',
+      ...(accessToken ? { authorization: `Bearer ${accessToken}` } : {}),
+      ...init.headers,
+    },
+  })
+  if (res.status === 401 && retry) {
+    const r = await fetch(`${BASE}/api/v1/auth/refresh`, { method: 'POST', credentials: 'include' })
+    if (r.ok) {
+      accessToken = (await r.json()).accessToken
+      return request<T>(path, init, false)
+    }
+  }
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({}) as { error?: string })
+    throw Object.assign(new Error(body.error ?? res.statusText), { status: res.status })
+  }
+  return res.json() as Promise<T>
+}
+
+export const dataService = {
+  login: async (email: string, password: string) => {
+    const out = await request<{ accessToken: string; user: unknown }>('/auth/login', {
+      method: 'POST', body: JSON.stringify({ email, password }),
+    })
+    accessToken = out.accessToken
+    return out.user
+  },
+  me: () => request('/auth/me'),
+  logout: () => request('/auth/logout', { method: 'POST' }).finally(() => (accessToken = null)),
+  listLeads: (filters: Record<string, string>) => request(`/leads?${new URLSearchParams(filters)}`),
+  getLead: (id: string) => request(`/leads/${id}`),
+  updateLead: (id: string, patch: object) => request(`/leads/${id}`, { method: 'PATCH', body: JSON.stringify(patch) }),
+  addLead: (partial: object) => request('/leads', { method: 'POST', body: JSON.stringify(partial) }),
+  getSettings: () => request('/workspace'),
+  updateSettings: (patch: object) => request('/workspace/settings', { method: 'PATCH', body: JSON.stringify(patch) }),
+}
+```
+
+If the dashboard and API live on sibling subdomains of one domain, set `COOKIE_DOMAIN=yourdomain.com` and keep `COOKIE_SAMESITE=lax`. If they're on entirely different domains, set `COOKIE_SAMESITE=none` (requires HTTPS).
+
+## Running this responsibly
+
+Self-hosting other businesses' lead data means **you** own uptime, security and data protection:
+
+- **Client names and emails are personal data.** A breach is a real liability. The encryption layers, the no-inbound-ports tunnel, workspace isolation and the audit log mitigate — they do not eliminate — that risk. Consider a simple written data-handling understanding with each client, and understand your local data-protection obligations (GDPR/CCPA equivalents). *This is not legal advice.*
+- **A home connection has no uptime guarantee.** Fine while dogfooding and for early, low-stakes clients; risky once someone pays for an SLA. The cloud-migration path below exists for exactly that moment.
+- **Backups only count if they restore.** Keep them encrypted, copy them off-box, and run the restore drill at least once (below).
+- Patch the host OS regularly; pull updated images (see [Updating](#updating)); consider Uptime Kuma for monitoring.
+
+## Backups & restore
+
+The `backup` service runs a **nightly encrypted dump** (default `BACKUP_CRON=15 2 * * *` UTC, plus one dump at container start) into the `backups` volume, pruning files older than `BACKUP_RETENTION_DAYS` (default 14).
+
+```bash
+# list backups
+docker compose exec backup ls -lh /backups
+
+# copy the newest off-box (do this regularly — an on-box backup is only half a backup)
+docker compose cp backup:/backups/leadline-2026-07-15_021500.sql.gz.gpg ./
+scp leadline-*.sql.gz.gpg you@offsite:/safe/place/
+
+# decrypt manually if ever needed
+gpg --batch --passphrase "$BACKUP_ENCRYPTION_KEY" -d leadline-….sql.gz.gpg | gunzip > dump.sql
+```
+
+**Restore drill — actually do this once** before you rely on it:
+
+```bash
+docker compose exec backup restore.sh /backups/leadline-<stamp>.sql.gz.gpg
+# The dump is --clean --if-exists: it drops and recreates objects in place.
+docker compose restart api && curl -s http://127.0.0.1:8080/ready
+```
+
+## Updating
+
+```bash
+git pull
+docker compose build --pull api backup
+docker compose up -d          # add your --profile flag
+docker image prune -f
+```
+
+Keep the host OS patched (`unattended-upgrades` on Debian/Ubuntu). Watchtower can auto-pull base images if you accept the tradeoff of unattended restarts.
+
+## Cloud migration checklist
+
+Everything is Docker + `.env` — no host-specific paths, no code changes:
+
+1. Provision a VM (any provider), install Docker + compose.
+2. Clone this repo; copy your `.env` over (secure channel!).
+3. Copy the latest backup file to the VM.
+4. `docker compose up -d db`, then run the restore drill command above.
+5. `docker compose --profile domain up -d` (or move the Cloudflare Tunnel: same token = zero DNS changes).
+6. Verify `/ready`, log in, confirm leads are present; update `CORS_ORIGIN`/DNS if hostnames changed.
+7. Decommission the home box's tunnel/port-forward.
+
+## Local development & tests
+
+No Docker needed locally — an embedded PostgreSQL 16 lives in `node_modules`:
+
+```bash
+npm ci
+npm run dev:db      # embedded Postgres 16 on 127.0.0.1:54322 (data in .devdb/)
+npm run dev         # API with reload (set DATABASE_URL from dev:db output in .env)
+npm test            # spins up a disposable embedded Postgres, migrates, runs vitest
+npm run build       # tsc → dist/
+npm run lint        # typecheck
+npx tsx scripts/dev-db.ts -- npx prisma migrate dev   # create a new migration
+npx tsx scripts/dev-db.ts -- npx tsx prisma/seed.ts   # seed the dev database
+```
+
+Tests cover auth (signup/login/refresh rotation/reuse detection/invites/roles/password change+reset), workspace isolation, lead CRUD, every list filter, aggregates, sorting, pagination, CSV, analytics, safe-field enforcement, credential encryption/masking, and ingest (key auth, idempotent upsert, human-field preservation, HMAC).
+
+## Design decisions & defaults
+
+Chosen where the spec left room; all adjustable per workspace via `PATCH /workspace/settings`:
+
+- **Stages:** `New, Contacted, Qualified, Proposal sent, Closed won, Closed lost, Not fit, Spam`; closed = the last four.
+- **Tiers:** hot ≥ 8, warm 5–7, cold ≤ 4 (`tierThresholds`).
+- **Win probability map:** 9–10 → 0.55 · 7–8 → 0.35 · 5–6 → 0.18 · 3–4 → 0.07 · 0–2 → 0.02.
+- **expectedValue** = midpoint of the deal range × winProbability; recomputed on every relevant write and on settings changes (manual winProbability overrides survive).
+- **needsAttention** = hot OR overdue OR (unassigned AND received within 7 days).
+- **Deletes are soft** (`deletedAt`), excluded from all queries, audited.
+- **Invites without SMTP** return the invite link in the API response (the inviter is authenticated). **Password-reset links without SMTP** are written to the server log only — returning them in the response would enable account takeover.
+- **Rate limits:** global per-IP (default 120/min), tighter on auth endpoints (10/min), per-key on ingest (600/min). Body limit 1 MiB.
+- **Audit log** records signups, logins (incl. failures), refresh-reuse detections, password changes/resets, invites, credential and API-key changes, settings updates and lead deletions, with IP.
+- Wire format matches the dashboard contract 1:1 (camelCase, ISO-8601 dates).
