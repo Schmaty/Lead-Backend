@@ -5,6 +5,8 @@ import { AppError } from '../../middleware/errorHandler.js'
 import { workspaceId } from '../../middleware/workspaceScope.js'
 import { audit } from '../../services/audit.js'
 import { applyComputed, computeExpectedValue } from '../../services/leadCompute.js'
+import { getZohoConfig } from '../../services/platformCredentials.js'
+import { CRM_PUSH_ENABLED, searchCrmByEmails } from '../../services/zoho.js'
 import { resolveSettings, type WorkspaceSettings } from '../../types/settings.js'
 import { buildLeadWhere, computeAggregates } from './query.js'
 import {
@@ -58,7 +60,7 @@ function sortOrder(query: ListLeadsQuery): Prisma.LeadOrderByWithRelationInput {
 }
 
 export default async function leadsRoutes(app: FastifyInstance): Promise<void> {
-  const { prisma } = app
+  const { prisma, config } = app
   const guard = authGuard(app)
   const ownerSelect = { select: { id: true, name: true } } as const
 
@@ -122,7 +124,7 @@ export default async function leadsRoutes(app: FastifyInstance): Promise<void> {
       .send(rows.join('\r\n') + '\r\n')
   })
 
-  // ── Detail incl. threads + timeline ────────────────────────────────────────
+  // ── Detail incl. threads + timeline + people + meetings ────────────────────
   app.get('/:id', { preHandler: [guard] }, async (request) => {
     const wsId = workspaceId(request)
     const { id } = request.params as { id: string }
@@ -132,6 +134,8 @@ export default async function leadsRoutes(app: FastifyInstance): Promise<void> {
         owner: ownerSelect,
         threads: { orderBy: { date: 'asc' } },
         timeline: { orderBy: { at: 'asc' } },
+        people: { orderBy: { lastSeenAt: 'desc' } },
+        meetings: { orderBy: { startsAt: 'desc' } },
       },
     })
     if (!lead) throw new AppError(404, 'Lead not found')
@@ -139,6 +143,40 @@ export default async function leadsRoutes(app: FastifyInstance): Promise<void> {
     const stageSince = lastStageChange?.at ?? lead.createdAt
     const timeInStageHours = Math.round(((Date.now() - stageSince.getTime()) / 3_600_000) * 10) / 10
     return { ...serializeLead(lead), timeInStageHours }
+  })
+
+  // ── CRM (Zoho) — read now, push coming soon ────────────────────────────────
+  app.get('/:id/crm', { preHandler: [guard] }, async (request) => {
+    const wsId = workspaceId(request)
+    const { id } = request.params as { id: string }
+    const lead = await prisma.lead.findFirst({
+      where: { id, workspaceId: wsId, deletedAt: null },
+      include: { people: { select: { email: true } } },
+    })
+    if (!lead) throw new AppError(404, 'Lead not found')
+    const zoho = await getZohoConfig(prisma, config)
+    if (!zoho) {
+      return { available: false, records: [], push: { comingSoon: true } }
+    }
+    const emails = [lead.email, ...lead.people.map((person) => person.email)].filter(Boolean)
+    try {
+      const records = await searchCrmByEmails(zoho, emails)
+      return { available: true, records, push: { comingSoon: true } }
+    } catch (err) {
+      app.log.error({ err, leadId: id }, 'zoho lookup failed')
+      throw new AppError(502, 'CRM lookup failed — check the Zoho connection')
+    }
+  })
+
+  /**
+   * Push-to-CRM is built but deliberately gated: the platform Zoho tokens are
+   * read-only today. Ships once a WRITE-scoped token is connected.
+   */
+  app.post('/:id/crm/push', { preHandler: [guard] }, async (request, reply) => {
+    if (!CRM_PUSH_ENABLED) {
+      return reply.status(501).send({ error: 'Pushing to Zoho CRM is coming soon', comingSoon: true })
+    }
+    return reply.status(501).send({ error: 'Pushing to Zoho CRM is coming soon', comingSoon: true })
   })
 
   // ── Manual add ─────────────────────────────────────────────────────────────

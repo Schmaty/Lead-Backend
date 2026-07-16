@@ -11,6 +11,7 @@ import {
 import { useOwnerOpts } from '../hooks'
 import { ICopy, ISend, IX, IZap } from '../icons'
 import { useDesk } from '../store'
+import LeadEnrichment from './LeadEnrichment'
 import { A, C, chipStyle, evDot, mono, serif, tierChip, upLabel } from '../styles'
 
 const selectS: CSSProperties = { width: '100%', padding: '8px 9px', border: `1px solid ${C.border2}`, borderRadius: 8, fontSize: 13, background: '#fff' }
@@ -298,6 +299,8 @@ export default function DetailDrawer(): ReactNode {
               <div style={{ fontSize: 12.5, color: C.faint }}>No related email threads.</div>
             )}
           </div>
+
+          <LeadEnrichment lead={lead} />
 
           <div style={{ marginBottom: 24 }}>
             <div style={{ ...upLabel, letterSpacing: '.07em', marginBottom: 10 }}>Notes</div>

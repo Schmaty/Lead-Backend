@@ -227,6 +227,8 @@ describe('Gmail connect (sign-in) flow', () => {
       },
       fetchSentEmails: async () => [],
       scoreEmail: async () => scored,
+      listMeetings: async () => [],
+      getMeetingInsight: async () => ({ tldr: '', text: '' }),
     })
     try {
       const result = await runScan(app.prisma, testConfig(ENV), client.workspace.id)

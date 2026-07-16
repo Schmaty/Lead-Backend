@@ -132,7 +132,7 @@ Returned by every lead endpoint. Fields marked ⚙ are computed server-side; ✍
 ```ts
 interface Lead {
   id: string
-  externalId: string | null      // email Message-ID / external id (null for manually added leads)
+  externalId: string | null      // conversation thread-root Message-ID / external id (null for manual leads)
   receivedAt: string             // ISO date the inquiry arrived
   name: string; email: string; org: string
   source: string                 // e.g. "Website form" | "Email" | "Referral" | "Event" | "Other"
@@ -164,7 +164,7 @@ interface Lead {
 }
 ```
 
-Timeline event `type` values: `created`, `stage_change`, `owner_change`, `follow_up_set`, `note_added`, `email_received`, `reply_sent`, `win_probability_set`. `actor` is a user's display name or `"system"` (inbox scanner / ingest webhook). The scanner writes `email_received` when a new inbound message merges into an existing conversation, and `reply_sent` / `stage_change` (actor `system`) when it notices one of your own replies in sent mail.
+Timeline event `type` values: `created`, `stage_change`, `owner_change`, `follow_up_set`, `note_added`, `email_received`, `reply_sent`, `meeting`, `win_probability_set`. `actor` is a user's display name or `"system"` (inbox scanner / ingest webhook). The scanner writes `email_received` when a new inbound message merges into an existing conversation, and `reply_sent` / `stage_change` (actor `system`) when it notices one of your own replies in sent mail.
 
 ### Computed-field semantics
 
@@ -266,6 +266,21 @@ Soft delete — the lead disappears from every list/detail/aggregate/analytics q
 
 ---
 
+### `GET /leads/:id/crm` — Zoho CRM matches (read-only)
+Searches the connected Zoho CRM (Leads + Contacts modules) for the lead's email **and every person on its profile**. → `{ available, records: [{ module, id, name, company, email, url }], push: { comingSoon: true } }`. `available: false` (empty records) until the developer stores the `ZOHO_CRM` platform credential; `502` if Zoho rejects the lookup. `url` deep-links into the Zoho UI.
+
+### `POST /leads/:id/crm/push` — coming soon
+Always `501 { "error": "Pushing to Zoho CRM is coming soon", "comingSoon": true }`. The feature is built but gated: current platform tokens are read-only; it ships once a WRITE-scoped Zoho token is connected. Frontends should render the button disabled with a "Coming soon" tag.
+
+### People & meetings on the lead detail
+
+`GET /leads/:id` also returns:
+
+- `people: [{ id, name, email, role, phone, notes, firstSeenAt, lastSeenAt }]` — everyone connected to the lead: the original sender (role `"Reached out"`), later correspondents in the thread, and meeting attendees (role `"Meeting attendee"`). Auto-maintained by the scanner; names/roles are never overwritten once set. Each `threads[]` entry carries `personId` linking the message to its person.
+- `meetings: [{ id, title, startsAt, endsAt, attendees, tldr, dossier, url }]` — meetings matched to this lead by attendee email from the connected meeting-AI provider (ambient.us), with the AI dossier text, its tldr, and a deep link. Each lands once (idempotent), adds a `meeting` timeline event, and feeds the next conversation re-score as context.
+
+---
+
 ## 6. Analytics (`GET /api/v1/analytics`, Bearer)
 
 Query: `from`, `to` (ISO dates; default = the last 90 days). The window filters on `receivedAt`. Soft-deleted leads are excluded. Everything is computed per-workspace.
@@ -339,13 +354,16 @@ Universal secrets shared by every workspace:
 
 | Kind | `value` (encrypted) | `meta` | Used for |
 |---|---|---|---|
-| `ANTHROPIC_API_KEY` | the one Anthropic key that scores all workspaces' mail (the platform absorbs the bill) | — | AI scoring |
+| `ANTHROPIC_API_KEY` | the one Anthropic key that scores all workspaces' mail (the platform absorbs the bill) | `{ model? }` — the scoring model; one of `claude-opus-4-8` (default) · `claude-sonnet-5` · `claude-sonnet-4-6` · `claude-haiku-4-5` | AI scoring + model picker |
 | `GOOGLE_OAUTH_CLIENT` | the OAuth client **secret** | `{ clientId }` (required) | the Google app clients sign in through; redirect URI is `PUBLIC_URL/api/v1/auth/google/callback` |
+| `AMBIENT_API_KEY` | the ambient.us API key | `{ baseUrl? }` (default `https://api.ambient.us/v1`) | meeting-dossier enrichment: matched meetings land on leads, attendees join people profiles |
+| `ZOHO_CRM` | JSON `{"clientSecret","refreshToken"}` | `{ clientId }` (required), `accountsUrl?`, `apiDomain?` | read-only CRM lookups on each lead. **Push is coming soon** — needs a WRITE-scoped token |
 
 | Call | Body | Returns |
 |---|---|---|
 | `GET /platform/credentials` | — | `{ credentials: [{ kind, maskedValue, meta, createdAt, updatedAt }] }` |
-| `PUT /platform/credentials/:kind` | `{ value, meta? }` | masked row — upsert = rotation. `400` if `GOOGLE_OAUTH_CLIENT` lacks `meta.clientId` |
+| `PUT /platform/credentials/:kind` | `{ value, meta? }` | masked row — upsert = rotation. `400` on invalid meta (missing `clientId`, unknown `model`) |
+| `PATCH /platform/credentials/:kind` | `{ meta }` | merge-updates meta **without re-pasting the secret** — how the model picker saves. `404` until the secret exists |
 | `DELETE /platform/credentials/:kind` | — | `{ ok: true }` (404 if absent) |
 
 Non-developers get `403 { "error": "Requires the developer account" }` on all three.
@@ -387,7 +405,7 @@ Irrelevant mail (newsletters, receipts, spam) is filed to the stage matching `/s
 | Call | Role | Returns |
 |---|---|---|
 | `POST /workspace/scan` | OWNER/ADMIN | `202 { started: true }` — the scan runs in the background. `400` if not configured, `409` if a scan is already running. Audited. |
-| `GET /workspace/scan/status` | any | `{ configured, method: "oauth"\|"imap"\|null, email, googleSignInAvailable, aiReady, running, progress, lastScanAt, pollMinutes, lastResult, lastError }` where `progress` (non-null only while running) = `{ phase: "connecting"\|"scoring"\|"replies", total, processed, imported, merged, updated, skipped, replies }` (`total` counts conversations, not raw emails) and `lastResult` = `{ at, scanned, imported, merged, updated, skipped, replies, errors: string[] }` |
+| `GET /workspace/scan/status` | any | `{ configured, method: "oauth"\|"imap"\|null, email, googleSignInAvailable, aiReady, running, progress, lastScanAt, pollMinutes, lastResult, lastError }` where `progress` (non-null only while running) = `{ phase: "connecting"\|"scoring"\|"replies"\|"meetings", total, processed, imported, merged, updated, skipped, replies, meetings }` (`total` counts conversations, not raw emails) and `lastResult` = `{ at, scanned, imported, merged, updated, skipped, replies, meetings, errors: string[] }` |
 
 Status drives the whole Settings UI: `email` null → show "Sign in with Google" (disabled with a call-your-developer note when `googleSignInAvailable` is false); `email` set → show the connected mailbox + Disconnect; `aiReady` false → the developer hasn't stored the platform key yet. Frontend flow for "Scan now": POST, poll status every ~2 s rendering `progress` ("Scoring conversation 3 of 12…", then "Checking sent mail…") until `running` is false, then show `lastResult`/`lastError` and refresh the lead list.
 
@@ -447,7 +465,8 @@ Responses: `201 { id, created: true }` on first sight of an `externalId`; `200 {
 | connect Gmail (client) | `POST /workspace/gmail/connect` → navigate to `url` → Google → callback redirects to `#/settings?gmail=connected` |
 | connection status / disconnect | `GET /workspace/credentials` · `DELETE /workspace/credentials/:kind` |
 | inbox scanning | `POST /workspace/scan` · `GET /workspace/scan/status` |
-| developer: platform keys | `GET/PUT/DELETE /platform/credentials[/:kind]` |
+| developer: platform keys | `GET/PUT/PATCH/DELETE /platform/credentials[/:kind]` (PATCH = model picker / meta) |
+| lead drawer: CRM panel | `GET /leads/:id/crm` · push button disabled ("coming soon") |
 | developer: external push | `PUT /workspace/credentials/:kind` · `GET/POST/DELETE /workspace/api-keys` |
 
 A ready-to-paste `apiDataService.ts` wrapper (with the 401-refresh-retry loop) is in the [README](../README.md#point-the-dashboard-at-it).

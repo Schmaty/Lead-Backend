@@ -47,6 +47,8 @@ export interface ConversationContext {
   previousSummary: string
   /** Recent exchange, oldest first. Includes both sides ('in' = the lead, 'out' = the business). */
   exchange: Array<{ direction: 'in' | 'out'; date: Date; subject: string; snippet: string }>
+  /** Meeting intel (from the transcript provider) tied to this lead, newest first. */
+  meetings?: Array<{ title: string; date: Date; tldr: string }>
 }
 
 function buildSystemPrompt(settings: WorkspaceSettings, workspaceName: string): string {
@@ -69,6 +71,10 @@ function buildEmailBlock(email: InboundEmail, context?: ConversationContext): st
   if (context) {
     parts.push('=== CONVERSATION SO FAR ===')
     if (context.previousSummary) parts.push(`Previous assessment: ${context.previousSummary}`, '')
+    for (const meeting of (context.meetings ?? []).slice(0, 3)) {
+      const tldr = meeting.tldr.length > 700 ? `${meeting.tldr.slice(0, 700)}…` : meeting.tldr
+      parts.push(`[MEETING · ${meeting.date.toISOString()}] ${meeting.title}`, tldr || '(no notes)', '')
+    }
     for (const message of context.exchange.slice(-EXCHANGE_LIMIT)) {
       const who = message.direction === 'in' ? 'THEM' : 'US'
       const text = message.snippet.length > 800 ? `${message.snippet.slice(0, 800)}…` : message.snippet
@@ -97,9 +103,10 @@ export async function scoreEmail(
   settings: WorkspaceSettings,
   workspaceName: string,
   context?: ConversationContext,
+  model: string = SCORER_MODEL,
 ): Promise<ScoredLead> {
   const response = await client.messages.parse({
-    model: SCORER_MODEL,
+    model,
     max_tokens: 16000,
     thinking: { type: 'adaptive' },
     system: buildSystemPrompt(settings, workspaceName),

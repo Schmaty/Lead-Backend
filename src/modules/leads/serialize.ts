@@ -1,9 +1,11 @@
-import type { Lead, Thread, TimelineEvent } from '@prisma/client'
+import type { Lead, Meeting, Person, Thread, TimelineEvent } from '@prisma/client'
 
 export type LeadWithRelations = Lead & {
   owner?: { id: string; name: string } | null
   threads?: Thread[]
   timeline?: TimelineEvent[]
+  people?: Person[]
+  meetings?: Meeting[]
 }
 
 /** Wire format for the dashboard: camelCase, no soft-delete internals. */
@@ -54,6 +56,31 @@ export function serializeLead(lead: LeadWithRelations): Record<string, unknown> 
       direction: thread.direction,
       date: thread.date,
       snippet: thread.snippet,
+      personId: thread.personId,
+    }))
+  }
+  if (lead.people !== undefined) {
+    out.people = lead.people.map((person) => ({
+      id: person.id,
+      name: person.name,
+      email: person.email,
+      role: person.role,
+      phone: person.phone,
+      notes: person.notes,
+      firstSeenAt: person.firstSeenAt,
+      lastSeenAt: person.lastSeenAt,
+    }))
+  }
+  if (lead.meetings !== undefined) {
+    out.meetings = lead.meetings.map((meeting) => ({
+      id: meeting.id,
+      title: meeting.title,
+      startsAt: meeting.startsAt,
+      endsAt: meeting.endsAt,
+      attendees: meeting.attendees,
+      tldr: meeting.tldr,
+      dossier: meeting.dossier,
+      url: meeting.url,
     }))
   }
   if (lead.timeline !== undefined) {

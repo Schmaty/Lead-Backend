@@ -94,6 +94,8 @@ model Lead {
   updatedAt                DateTime        @updatedAt
   threads                  Thread[]
   timeline                 TimelineEvent[]
+  people                   Person[]
+  meetings                 Meeting[]
 
   @@unique([workspaceId, externalId])
   @@index([workspaceId])
@@ -112,7 +114,49 @@ model Thread {
   direction String
   date      DateTime
   snippet   String
+  personId  String?
+  person    Person?  @relation(fields: [personId], references: [id], onDelete: SetNull)
 
+  @@index([leadId])
+}
+
+/// A human connected to the lead: whoever reached out, meeting attendees,
+/// anyone in the conversation. Auto-maintained by the scanner and the
+/// meeting-enrichment pass; email threads hang off the person via Thread.personId.
+model Person {
+  id          String   @id @default(cuid())
+  leadId      String
+  lead        Lead     @relation(fields: [leadId], references: [id], onDelete: Cascade)
+  name        String
+  email       String   @default("")
+  role        String   @default("")
+  phone       String   @default("")
+  notes       String   @default("")
+  firstSeenAt DateTime @default(now())
+  lastSeenAt  DateTime @default(now())
+  threads     Thread[]
+
+  @@index([leadId])
+}
+
+/// A meeting matched to this lead (via attendee emails) from the connected
+/// meeting-transcript provider, with its AI dossier/tldr for enrichment.
+model Meeting {
+  id         String   @id @default(cuid())
+  leadId     String
+  lead       Lead     @relation(fields: [leadId], references: [id], onDelete: Cascade)
+  externalId String
+  title      String
+  startsAt   DateTime
+  endsAt     DateTime?
+  attendees  Json     @default("[]")
+  tldr       String   @default("")
+  dossier    String   @default("")
+  url        String   @default("")
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  @@unique([leadId, externalId])
   @@index([leadId])
 }
 

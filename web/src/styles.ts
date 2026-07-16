@@ -179,6 +179,7 @@ export function evDot(type: string): CSSProperties {
     stage_change: A,
     owner_change: '#2A4B7C',
     email_received: '#2A4B7C',
+    meeting: '#7C5CBF',
     reply_sent: C.ok,
     note_added: C.warn,
     follow_up_set: '#8A6D3B',

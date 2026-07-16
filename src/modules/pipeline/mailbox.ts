@@ -43,7 +43,7 @@ const addressList = (value: AddressObject | AddressObject[] | undefined): string
 }
 
 function connect(config: MailboxConfig): ImapFlow {
-  return new ImapFlow({
+  const client = new ImapFlow({
     host: config.host,
     port: config.port,
     secure: true,
@@ -52,6 +52,10 @@ function connect(config: MailboxConfig): ImapFlow {
       : { user: config.user, pass: config.pass ?? '' },
     logger: false,
   })
+  // Gmail resets sockets after logout; an unhandled 'error' event would kill
+  // the whole process. In-flight operations still reject through the API.
+  client.on('error', () => {})
+  return client
 }
 
 async function fetchFromMailbox(

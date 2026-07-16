@@ -35,6 +35,44 @@ export interface Thread {
   direction: 'in' | 'out'
   date: string
   snippet: string
+  personId?: string | null
+}
+
+export interface Person {
+  id: string
+  name: string
+  email: string
+  role: string
+  phone: string
+  notes: string
+  firstSeenAt: string
+  lastSeenAt: string
+}
+
+export interface Meeting {
+  id: string
+  title: string
+  startsAt: string
+  endsAt: string | null
+  attendees: Array<{ name: string; email: string; organizer: boolean }>
+  tldr: string
+  dossier: string
+  url: string
+}
+
+export interface CrmRecord {
+  module: 'Leads' | 'Contacts'
+  id: string
+  name: string
+  company: string
+  email: string
+  url: string
+}
+
+export interface CrmLookup {
+  available: boolean
+  records: CrmRecord[]
+  push: { comingSoon: boolean }
 }
 
 export interface TimelineEvent {
@@ -81,6 +119,8 @@ export interface Lead {
   createdAt: string
   updatedAt: string
   threads?: Thread[]
+  people?: Person[]
+  meetings?: Meeting[]
   timeline?: TimelineEvent[]
   timeInStageHours?: number
 }
@@ -229,11 +269,13 @@ export interface ScanResult {
   skipped: number
   /** Outbound replies detected in sent mail and attached to leads. */
   replies: number
+  /** Meetings newly attached to leads by the transcript provider. */
+  meetings: number
   errors: string[]
 }
 
 export interface ScanProgress {
-  phase: 'connecting' | 'scoring' | 'replies'
+  phase: 'connecting' | 'scoring' | 'replies' | 'meetings'
   /** Conversations to score, not raw emails. */
   total: number
   processed: number
@@ -242,6 +284,7 @@ export interface ScanProgress {
   updated: number
   skipped: number
   replies: number
+  meetings: number
 }
 
 export interface ScanStatus {

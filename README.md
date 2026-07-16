@@ -51,13 +51,15 @@ Base path: `/api/v1`. All responses are JSON in camelCase. This section is a sum
 | | `GET /api/v1/auth/google/callback` | public (Google redirects here); stores the workspace's `GMAIL_OAUTH` refresh token, bounces back to Settings |
 | | `POST /api/v1/workspace/scan` | OWNER/ADMIN; kicks off an inbox scan in the background → `202 { started: true }` |
 | | `GET /api/v1/workspace/scan/status` | `{ configured, method, email, googleSignInAvailable, aiReady, running, progress, lastScanAt, pollMinutes, lastResult, lastError }` — `progress` reports live per-email counts while a scan runs |
-| Platform | `GET/PUT/DELETE /api/v1/platform/credentials[/:kind]` | **developer-only**; kinds: `ANTHROPIC_API_KEY` (universal AI key), `GOOGLE_OAUTH_CLIENT` (value = client secret, `meta.clientId`) |
+| Platform | `GET/PUT/PATCH/DELETE /api/v1/platform/credentials[/:kind]` | **developer-only**; kinds: `ANTHROPIC_API_KEY` (universal AI key; `meta.model` picks the scoring model), `GOOGLE_OAUTH_CLIENT`, `AMBIENT_API_KEY` (meeting AI), `ZOHO_CRM` (read now — push coming soon). PATCH updates meta only (e.g. the model picker) |
 | Leads | `GET /api/v1/leads` | filters/sort/search/pagination + `aggregates` (see below) |
 | | `GET /api/v1/leads/export.csv` | same filters, CSV download |
 | | `GET /api/v1/leads/:id` | full record incl. `threads`, `timeline`, `timeInStageHours` |
 | | `POST /api/v1/leads` | manual add; computes tier/winProbability/expectedValue |
 | | `PATCH /api/v1/leads/:id` | **safe fields only** (see below) |
 | | `DELETE /api/v1/leads/:id` | OWNER/ADMIN; soft delete; audited |
+| | `GET /api/v1/leads/:id/crm` | matching Zoho CRM records for the lead + its people (read-only) |
+| | `POST /api/v1/leads/:id/crm/push` | **coming soon** — always `501 { comingSoon: true }` until a WRITE-scoped Zoho token ships |
 | Analytics | `GET /api/v1/analytics?from&to` | funnel, win rate, won value, weekly trends, first-response time, source performance, score calibration |
 | Ingest | `POST /api/v1/ingest/leads` | **`x-api-key` auth (not user auth)**; idempotent upsert by `externalId` |
 
@@ -239,6 +241,16 @@ A lead is a **conversation**, not a single email. Messages thread together by th
 Your side of the conversation is tracked too: each scan also reads the account's **sent mail** and attaches your replies to the matching lead — the reply appears in the thread (outbound), `replySent` flips on, a `reply_sent` event hits the timeline, and a lead still sitting in the first stage auto-advances to the contacted stage (leads a human has already moved are left alone).
 
 Re-scans are idempotent — conversations are keyed by their thread root, already-seen messages are recognized (and spend no AI calls), nothing ever duplicates.
+
+### People, meetings, and the CRM
+
+Every lead keeps a **people profile**: whoever reached out, every extra correspondent that joins the thread, and everyone who sat in a matched meeting — with contact info, first/last-seen, and their messages attached (each email thread entry links to its person). The scanner maintains this automatically.
+
+With the **Ambient meeting AI** connected (developer: Settings → Platform), each scan also matches recent meetings to leads by attendee email: the meeting lands on the lead with its AI dossier + tldr and a link back to Ambient, attendees join the people profile, a `meeting` event hits the timeline — and the next re-score reads the meeting intel as context.
+
+With **Zoho CRM** connected, every lead's drawer gets a CRM panel that looks up matching Zoho Leads/Contacts for the lead's people (read-only, with deep links). **Pushing leads to Zoho is built but gated "coming soon"** — the current platform token carries read-only scopes; it ships once a WRITE-scoped token is connected.
+
+The developer Platform card also carries a **scoring-model picker** (Opus 4.8 default, Sonnet 5, Sonnet 4.6, Haiku 4.5) — switch what Claude model scores mail without touching the key.
 
 ## Optional: push leads from an external tool
 

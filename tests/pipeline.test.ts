@@ -3,6 +3,7 @@ import type { FastifyInstance } from 'fastify'
 import type { InboundEmail, MailboxConfig } from '../src/modules/pipeline/mailbox.js'
 import { runScan, setScanDepsForTesting, type ScanDeps } from '../src/modules/pipeline/scanner.js'
 import { normalizeScoredLead, type ConversationContext, type ScoredLead } from '../src/modules/pipeline/scorer.js'
+import type { AmbientInsight, AmbientMeeting } from '../src/services/ambient.js'
 import { DEFAULT_SETTINGS } from '../src/types/settings.js'
 import { addMember, api, makeApp, resetDb, signup, testConfig, type Session } from './helpers.js'
 
@@ -85,8 +86,10 @@ const scoredFor: Record<string, ScoredLead> = {
 interface FakeDepOptions {
   sent?: InboundEmail[]
   sinceLog?: Date[]
-  /** Records every scoring call: which email, with what conversation context. */
-  scoreCalls?: Array<{ messageId: string; context?: ConversationContext }>
+  meetings?: AmbientMeeting[]
+  insights?: Record<string, AmbientInsight>
+  /** Records every scoring call: which email, with what conversation context and model. */
+  scoreCalls?: Array<{ messageId: string; context?: ConversationContext; model?: string }>
 }
 
 function fakeDeps(emails: InboundEmail[], options: FakeDepOptions = {}): ScanDeps {
@@ -96,12 +99,14 @@ function fakeDeps(emails: InboundEmail[], options: FakeDepOptions = {}): ScanDep
       return emails
     },
     fetchSentEmails: async () => options.sent ?? [],
-    scoreEmail: async (_apiKey, email, _settings, _workspaceName, context) => {
-      options.scoreCalls?.push({ messageId: email.messageId, context })
+    scoreEmail: async (_apiKey, email, _settings, _workspaceName, context, model) => {
+      options.scoreCalls?.push({ messageId: email.messageId, context, model })
       const scored = scoredFor[email.messageId]
       if (!scored) throw new Error(`no fake score for ${email.messageId}`)
       return scored
     },
+    listMeetings: async () => options.meetings ?? [],
+    getMeetingInsight: async (_config, insightId) => options.insights?.[insightId] ?? { tldr: '', text: '' },
   }
 }
 
@@ -262,6 +267,8 @@ describe('scan route flow', () => {
         await new Promise((resolve) => setTimeout(resolve, 250))
         return scoredFor[email.messageId]!
       },
+      listMeetings: async () => [],
+      getMeetingInsight: async () => ({ tldr: '', text: '' }),
     }
     const restore = setScanDepsForTesting(slowDeps)
     try {

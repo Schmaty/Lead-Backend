@@ -12,6 +12,13 @@ const credBox: CSSProperties = { border: `1px solid ${C.line}`, borderRadius: 10
 const credInput: CSSProperties = { padding: '8px 10px', border: `1px solid ${C.border2}`, borderRadius: 7, fontSize: 12.5, fontFamily: mono, background: C.bg2 }
 const devBadge: CSSProperties = { fontSize: 10, fontWeight: 700, letterSpacing: '.08em', color: '#fff', background: A, borderRadius: 5, padding: '3px 7px', textTransform: 'uppercase' }
 
+const SCORER_MODELS: Array<[string, string]> = [
+  ['claude-opus-4-8', 'Claude Opus 4.8 — sharpest (default)'],
+  ['claude-sonnet-5', 'Claude Sonnet 5 — balanced'],
+  ['claude-sonnet-4-6', 'Claude Sonnet 4.6'],
+  ['claude-haiku-4-5', 'Claude Haiku 4.5 — cheapest'],
+]
+
 function StoredValue({ cred, onRemove }: { cred: CredentialRow; onRemove: () => void }): ReactNode {
   return (
     <div style={{ display: 'flex', alignItems: 'center', gap: 10, flex: '0 0 auto' }}>
@@ -36,6 +43,10 @@ export default function ConnectionTab(): ReactNode {
   const [gmailPass, setGmailPass] = useState('')
   const [webhookSecret, setWebhookSecret] = useState('')
   const [newKeyName, setNewKeyName] = useState('')
+  const [ambientKey, setAmbientKey] = useState('')
+  const [zohoId, setZohoId] = useState('')
+  const [zohoSecret, setZohoSecret] = useState('')
+  const [zohoRefresh, setZohoRefresh] = useState('')
   const pollRef = useRef<number | null>(null)
 
   const findCred = (kind: string): CredentialRow | undefined => st.credentials.find((c) => c.kind === kind)
@@ -43,6 +54,32 @@ export default function ConnectionTab(): ReactNode {
   const webhookCred = findCred('N8N_WEBHOOK')
   const anthropicCred = findPlatform('ANTHROPIC_API_KEY')
   const googleCred = findPlatform('GOOGLE_OAUTH_CLIENT')
+  const ambientCred = findPlatform('AMBIENT_API_KEY')
+  const zohoCred = findPlatform('ZOHO_CRM')
+  const currentModel = typeof anthropicCred?.meta.model === 'string' ? anthropicCred.meta.model : 'claude-opus-4-8'
+
+  const pickModel = async (model: string): Promise<void> => {
+    try {
+      await api.patchPlatformCredential('ANTHROPIC_API_KEY', { model })
+      desk.toast(`Scorer model set to ${model}`)
+      void loadPlatform()
+    } catch (e) {
+      desk.toast(e instanceof Error ? e.message : 'Could not change the model')
+    }
+  }
+
+  const saveZoho = async (): Promise<void> => {
+    if (!zohoId.trim() || !zohoSecret.trim() || !zohoRefresh.trim()) {
+      desk.toast('Zoho needs the client ID, client secret, and refresh token.')
+      return
+    }
+    await savePlatform(
+      'ZOHO_CRM',
+      JSON.stringify({ clientSecret: zohoSecret.trim(), refreshToken: zohoRefresh.trim() }),
+      { clientId: zohoId.trim() },
+      () => { setZohoId(''); setZohoSecret(''); setZohoRefresh('') },
+    )
+  }
 
   const loadStatus = async (): Promise<void> => {
     const status = await api.scanStatus().catch(() => null)
@@ -83,7 +120,12 @@ export default function ConnectionTab(): ReactNode {
         if (status.lastError) desk.toast(`Scan failed: ${status.lastError}`)
         else if (status.lastResult) {
           const r = status.lastResult
-          const parts = [`${r.imported} new`, `${r.merged} merged`, ...(r.replies ? [`${r.replies} replies tracked`] : [])]
+          const parts = [
+            `${r.imported} new`,
+            `${r.merged} merged`,
+            ...(r.replies ? [`${r.replies} replies tracked`] : []),
+            ...(r.meetings ? [`${r.meetings} meetings attached`] : []),
+          ]
           desk.toast(`Scan complete — ${parts.join(', ')}`)
         }
         void desk.refreshLeads()
@@ -170,7 +212,9 @@ export default function ConnectionTab(): ReactNode {
             </div>
             <div style={{ fontSize: 12, color: C.sub, marginTop: 2, lineHeight: 1.45 }}>
               {scan?.running
-                ? scan.progress?.phase === 'replies'
+                ? scan.progress?.phase === 'meetings'
+                  ? `Matching meetings to leads…${scan.progress.meetings ? ` ${scan.progress.meetings} attached` : ''}`
+                  : scan.progress?.phase === 'replies'
                   ? `Checking sent mail for your replies…${scan.progress.replies ? ` ${scan.progress.replies} tracked` : ''}`
                   : scan.progress?.phase === 'scoring'
                     ? scan.progress.total === 0
@@ -179,7 +223,7 @@ export default function ConnectionTab(): ReactNode {
                     : 'Connecting to the inbox and reading new mail…'
                 : configured
                   ? scan?.lastScanAt
-                    ? `Last scan ${fmtDate(scan.lastScanAt)}${lastResult ? ` — ${lastResult.imported} new, ${lastResult.merged} merged into existing leads, ${lastResult.replies} replies tracked${lastResult.errors.length ? `, ${lastResult.errors.length} errors` : ''}` : ''}`
+                    ? `Last scan ${fmtDate(scan.lastScanAt)}${lastResult ? ` — ${lastResult.imported} new, ${lastResult.merged} merged, ${lastResult.replies} replies${lastResult.meetings ? `, ${lastResult.meetings} meetings` : ''}${lastResult.errors.length ? `, ${lastResult.errors.length} errors` : ''}` : ''}`
                     : 'Ready — the first scan reads the last 7 days of mail.'
                   : mailboxConnected && !scan?.aiReady
                     ? 'Mailbox connected. AI scoring isn’t enabled yet — your developer needs to finish platform setup.'
@@ -270,6 +314,18 @@ export default function ConnectionTab(): ReactNode {
                 <input value={anthropicKey} onChange={(e) => setAnthropicKey(e.target.value)} type="password" placeholder="sk-ant-…" style={{ ...credInput, flex: 1 }} />
                 <button onClick={() => void savePlatform('ANTHROPIC_API_KEY', anthropicKey, undefined, () => setAnthropicKey(''))} style={btnSmall}>Save</button>
               </div>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginTop: 12, flexWrap: 'wrap' }}>
+                <span style={{ fontSize: 12, fontWeight: 600, color: C.sub }}>Scoring model</span>
+                <select
+                  value={currentModel}
+                  disabled={!anthropicCred}
+                  onChange={(e) => void pickModel(e.target.value)}
+                  style={{ padding: '7px 9px', border: `1px solid ${C.border2}`, borderRadius: 7, fontSize: 12.5, background: '#fff', opacity: anthropicCred ? 1 : 0.5 }}
+                >
+                  {SCORER_MODELS.map(([id, label]) => (<option key={id} value={id}>{label}</option>))}
+                </select>
+                {!anthropicCred && <span style={{ fontSize: 11.5, color: C.faint }}>store the key first</span>}
+              </div>
             </div>
             <div style={credBox}>
               <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 10, flexWrap: 'wrap' }}>
@@ -294,6 +350,43 @@ export default function ConnectionTab(): ReactNode {
                 >
                   Save
                 </button>
+              </div>
+            </div>
+            <div style={credBox}>
+              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 10, flexWrap: 'wrap' }}>
+                <div style={{ minWidth: 0 }}>
+                  <div style={{ fontSize: 13, fontWeight: 600 }}>Ambient meeting AI</div>
+                  <div style={{ fontSize: 11.5, color: C.faint, marginTop: 1 }}>
+                    Matches meeting dossiers from ambient.us to leads by attendee email — enriches scoring and builds people profiles.
+                  </div>
+                </div>
+                {ambientCred && <StoredValue cred={ambientCred} onRemove={() => void removePlatform('AMBIENT_API_KEY')} />}
+              </div>
+              <div style={{ display: 'flex', gap: 8, marginTop: 10 }}>
+                <input value={ambientKey} onChange={(e) => setAmbientKey(e.target.value)} type="password" placeholder="amb_…" style={{ ...credInput, flex: 1 }} />
+                <button onClick={() => void savePlatform('AMBIENT_API_KEY', ambientKey, undefined, () => setAmbientKey(''))} style={btnSmall}>Save</button>
+              </div>
+            </div>
+            <div style={credBox}>
+              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 10, flexWrap: 'wrap' }}>
+                <div style={{ minWidth: 0 }}>
+                  <div style={{ fontSize: 13, fontWeight: 600 }}>
+                    Zoho CRM
+                    <span style={{ fontSize: 10, fontWeight: 700, letterSpacing: '.06em', textTransform: 'uppercase', color: C.warn, background: 'rgba(181,71,8,.09)', borderRadius: 999, padding: '3px 8px', marginLeft: 8 }}>
+                      Push · coming soon
+                    </span>
+                  </div>
+                  <div style={{ fontSize: 11.5, color: C.faint, marginTop: 1 }}>
+                    Read access now (CRM matches show on each lead){zohoCred && typeof zohoCred.meta.clientId === 'string' ? ` — client ${zohoCred.meta.clientId.slice(0, 18)}…` : ''}. Pushing leads to Zoho ships later and needs a WRITE-scoped token.
+                  </div>
+                </div>
+                {zohoCred && <StoredValue cred={zohoCred} onRemove={() => void removePlatform('ZOHO_CRM')} />}
+              </div>
+              <div style={{ display: 'flex', gap: 8, marginTop: 10, flexWrap: 'wrap' }}>
+                <input value={zohoId} onChange={(e) => setZohoId(e.target.value)} placeholder="Client ID (1000.…)" style={{ ...credInput, flex: 1, minWidth: 150 }} />
+                <input value={zohoSecret} onChange={(e) => setZohoSecret(e.target.value)} type="password" placeholder="Client secret" style={{ ...credInput, flex: 1, minWidth: 130 }} />
+                <input value={zohoRefresh} onChange={(e) => setZohoRefresh(e.target.value)} type="password" placeholder="Refresh token" style={{ ...credInput, flex: 1, minWidth: 130 }} />
+                <button onClick={() => void saveZoho()} style={btnSmall}>Save</button>
               </div>
             </div>
             <div style={credBox}>

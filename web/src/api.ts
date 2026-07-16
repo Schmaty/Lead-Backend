@@ -2,6 +2,7 @@ import type {
   ApiKeyRow,
   Aggregates,
   CredentialRow,
+  CrmLookup,
   Lead,
   Role,
   ScanStatus,
@@ -157,6 +158,12 @@ export const api = {
     }),
   deletePlatformCredential: (kind: string) =>
     request<{ ok: boolean }>(`/platform/credentials/${kind}`, { method: 'DELETE' }),
+  /** Merge-update a platform credential's meta (e.g. the scorer model) without re-pasting the secret. */
+  patchPlatformCredential: (kind: string, meta: Record<string, unknown>) =>
+    request<{ kind: string; meta: Record<string, unknown> }>(`/platform/credentials/${kind}`, {
+      method: 'PATCH',
+      body: JSON.stringify({ meta }),
+    }),
   apiKeys: () => request<{ apiKeys: ApiKeyRow[] }>('/workspace/api-keys'),
   createApiKey: (name: string) =>
     request<{ id: string; name: string; prefix: string; key: string }>('/workspace/api-keys', post({ name })),
@@ -182,4 +189,6 @@ export const api = {
   patchLead: (id: string, patch: Record<string, unknown>) =>
     request<Lead>(`/leads/${id}`, { method: 'PATCH', body: JSON.stringify(patch) }),
   deleteLead: (id: string) => request<{ ok: boolean }>(`/leads/${id}`, { method: 'DELETE' }),
+  /** Zoho CRM records matched to this lead (read-only; push is coming soon). */
+  leadCrm: (id: string) => request<CrmLookup>(`/leads/${id}/crm`),
 }

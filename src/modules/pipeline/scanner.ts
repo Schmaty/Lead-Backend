@@ -2,10 +2,20 @@ import type { PrismaClient } from '@prisma/client'
 import type { AppConfig } from '../../config.js'
 import { decryptSecret } from '../../crypto/secrets.js'
 import { AppError } from '../../middleware/errorHandler.js'
-import { upsertLeadByExternalId, type UpsertThread } from '../../services/leadUpsert.js'
 import {
+  getInsight,
+  listPastMeetings,
+  type AmbientInsight,
+  type AmbientMeeting,
+} from '../../services/ambient.js'
+import { upsertLeadByExternalId, type UpsertThread } from '../../services/leadUpsert.js'
+import { upsertPerson } from '../../services/people.js'
+import {
+  getAmbientConfig,
   getGoogleOauthClient,
   getPlatformAnthropicKey,
+  getScorerModel,
+  type AmbientConfig,
   type GoogleOauthClient,
 } from '../../services/platformCredentials.js'
 import { resolveSettings, type WorkspaceSettings } from '../../types/settings.js'
@@ -50,13 +60,15 @@ export interface ScanResult {
   skipped: number
   /** Outbound replies detected in sent mail and attached to leads. */
   replies: number
+  /** Meetings (from the transcript provider) newly attached to leads. */
+  meetings: number
   errors: string[]
 }
 
 /** Live progress while a scan runs — what the dashboard banner renders. */
 export interface ScanProgress {
-  /** 'connecting' during IMAP fetch; 'scoring' per conversation; 'replies' during the sent-mail pass. */
-  phase: 'connecting' | 'scoring' | 'replies'
+  /** 'connecting' during IMAP fetch; 'scoring' per conversation; 'replies' during the sent-mail pass; 'meetings' during transcript enrichment. */
+  phase: 'connecting' | 'scoring' | 'replies' | 'meetings'
   /** Conversations to score (not raw emails). */
   total: number
   processed: number
@@ -65,6 +77,7 @@ export interface ScanProgress {
   updated: number
   skipped: number
   replies: number
+  meetings: number
 }
 
 interface ScanState {
@@ -94,14 +107,19 @@ export interface ScanDeps {
     settings: WorkspaceSettings,
     workspaceName: string,
     context?: ConversationContext,
+    model?: string,
   ) => Promise<ScoredLead>
+  listMeetings: (config: AmbientConfig, since: Date) => Promise<AmbientMeeting[]>
+  getMeetingInsight: (config: AmbientConfig, insightId: string) => Promise<AmbientInsight>
 }
 
 let defaultDeps: ScanDeps = {
   fetchEmails: fetchRecentEmails,
   fetchSentEmails,
-  scoreEmail: (apiKey, email, settings, workspaceName, context) =>
-    scoreEmail(createAnthropic(apiKey), email, settings, workspaceName, context),
+  scoreEmail: (apiKey, email, settings, workspaceName, context, model) =>
+    scoreEmail(createAnthropic(apiKey), email, settings, workspaceName, context, model),
+  listMeetings: (config, since) => listPastMeetings(config, since),
+  getMeetingInsight: (config, insightId) => getInsight(config, insightId),
 }
 
 /** Test hook: swap the IMAP/Anthropic edges for fakes. Returns a restore fn. */
@@ -131,6 +149,10 @@ interface ScanCredentials {
   host: string
   port: number
   anthropicApiKey: string
+  /** Developer-picked Claude model for scoring. */
+  scorerModel: string
+  /** Meeting-transcript provider, when the developer connected one. */
+  ambient: AmbientConfig | null
   /** The workspace credential row that carries the lastScanAt cursor in meta. */
   credentialId: string
   lastScanAt: Date | null
@@ -159,12 +181,14 @@ export async function resolveScanSetup(
   config: AppConfig,
   workspaceId: string,
 ): Promise<{ info: ScanConfigInfo; credentials: ScanCredentials | null }> {
-  const [oauthCred, imapCred, legacyAnthropic, platformKey, googleClient] = await Promise.all([
+  const [oauthCred, imapCred, legacyAnthropic, platformKey, googleClient, scorerModel, ambient] = await Promise.all([
     prisma.credential.findUnique({ where: { workspaceId_kind: { workspaceId, kind: GMAIL_OAUTH_KIND } } }),
     prisma.credential.findUnique({ where: { workspaceId_kind: { workspaceId, kind: GMAIL_IMAP_KIND } } }),
     prisma.credential.findUnique({ where: { workspaceId_kind: { workspaceId, kind: LEGACY_ANTHROPIC_KIND } } }),
     getPlatformAnthropicKey(prisma, config),
     getGoogleOauthClient(prisma, config),
+    getScorerModel(prisma, config),
+    getAmbientConfig(prisma, config),
   ])
 
   let anthropicApiKey = platformKey
@@ -187,6 +211,8 @@ export async function resolveScanSetup(
       host: DEFAULT_IMAP_HOST,
       port: DEFAULT_IMAP_PORT,
       anthropicApiKey,
+      scorerModel,
+      ambient,
       credentialId: oauthCred.id,
       lastScanAt: oauthMeta.lastScanAt ? new Date(oauthMeta.lastScanAt) : null,
       refreshToken: decryptSecret(oauthCred.encryptedValue, config.encryptionKey),
@@ -199,6 +225,8 @@ export async function resolveScanSetup(
       host: imapMeta.host || DEFAULT_IMAP_HOST,
       port: imapMeta.port || DEFAULT_IMAP_PORT,
       anthropicApiKey,
+      scorerModel,
+      ambient,
       credentialId: imapCred.id,
       lastScanAt: imapMeta.lastScanAt ? new Date(imapMeta.lastScanAt) : null,
       pass: decryptSecret(imapCred.encryptedValue, config.encryptionKey),
@@ -293,7 +321,7 @@ export async function runScan(
 
   state.running = true
   state.lastError = undefined
-  const progress: ScanProgress = { phase: 'connecting', total: 0, processed: 0, imported: 0, merged: 0, updated: 0, skipped: 0, replies: 0 }
+  const progress: ScanProgress = { phase: 'connecting', total: 0, processed: 0, imported: 0, merged: 0, updated: 0, skipped: 0, replies: 0, meetings: 0 }
   state.progress = progress
   const startedAt = new Date()
   try {
@@ -315,7 +343,7 @@ export async function runScan(
     }
 
     const emails = await deps.fetchEmails(mailbox, since, MAX_EMAILS_PER_SCAN)
-    const result: ScanResult = { at: startedAt.toISOString(), scanned: emails.length, imported: 0, merged: 0, updated: 0, skipped: 0, replies: 0, errors: [] }
+    const result: ScanResult = { at: startedAt.toISOString(), scanned: emails.length, imported: 0, merged: 0, updated: 0, skipped: 0, replies: 0, meetings: 0, errors: [] }
     const ownAddress = credentials.email.toLowerCase()
 
     // ── Group inbound mail into conversations ────────────────────────────────
@@ -342,7 +370,10 @@ export async function runScan(
       try {
         const existing = await prisma.lead.findUnique({
           where: { workspaceId_externalId: { workspaceId, externalId: threadKey } },
-          include: { threads: { orderBy: { date: 'asc' } } },
+          include: {
+            threads: { orderBy: { date: 'asc' } },
+            meetings: { orderBy: { startsAt: 'desc' }, take: 3 },
+          },
         })
 
         // Overlap re-read with nothing new → no AI call, nothing to change.
@@ -374,13 +405,25 @@ export async function runScan(
                     snippet: email.text.slice(0, 800),
                   })),
                 ],
+                meetings: (existing?.meetings ?? []).map((meeting) => ({
+                  title: meeting.title,
+                  date: meeting.startsAt,
+                  tldr: meeting.tldr,
+                })),
               }
             : undefined
 
-        const scored = await deps.scoreEmail(credentials.anthropicApiKey, newest, settings, workspace.name, context)
+        const scored = await deps.scoreEmail(
+          credentials.anthropicApiKey,
+          newest,
+          settings,
+          workspace.name,
+          context,
+          credentials.scorerModel,
+        )
         const spamStage = settings.stages.find((s) => /spam/i.test(s))
         const first = group[0]!
-        const { created, addedThreads } = await upsertLeadByExternalId(
+        const { lead, created, addedThreads } = await upsertLeadByExternalId(
           prisma,
           workspaceId,
           settings,
@@ -421,6 +464,21 @@ export async function runScan(
           result.updated++
           progress.updated++
         }
+
+        // Keep the person profile: the sender belongs to this lead, and their
+        // messages hang off their profile via Thread.personId. On a merge the
+        // sender may be a NEW correspondent — their display name wins over the
+        // AI's lead-level name (which describes the primary contact).
+        const personId = await upsertPerson(prisma, lead.id, {
+          name: created ? scored.name || newest.from.name : newest.from.name || scored.name,
+          email: newest.from.address,
+          role: created ? 'Reached out' : undefined,
+          seenAt: newest.date,
+        })
+        await prisma.thread.updateMany({
+          where: { leadId: lead.id, personId: null, url: { in: group.map((email) => messageUrl(email.messageId)) } },
+          data: { personId },
+        })
       } catch (err) {
         result.errors.push(`"${group[0]!.subject}": ${err instanceof Error ? err.message : String(err)}`)
       } finally {
@@ -445,6 +503,25 @@ export async function runScan(
       }
     } catch (err) {
       result.errors.push(`sent mailbox: ${err instanceof Error ? err.message : String(err)}`)
+    }
+
+    // ── Enrich leads with meeting intel from the transcript provider ─────────
+    if (credentials.ambient) {
+      progress.phase = 'meetings'
+      try {
+        const meetings = await deps.listMeetings(credentials.ambient, since)
+        for (const meeting of meetings) {
+          try {
+            const attached = await attachMeeting(prisma, workspaceId, credentials.ambient, meeting, ownAddress, deps)
+            result.meetings += attached
+            progress.meetings += attached
+          } catch (err) {
+            result.errors.push(`meeting "${meeting.title}": ${err instanceof Error ? err.message : String(err)}`)
+          }
+        }
+      } catch (err) {
+        result.errors.push(`meetings: ${err instanceof Error ? err.message : String(err)}`)
+      }
     }
 
     // Advance the scan cursor (merge — keep email/host in meta).
@@ -510,6 +587,12 @@ async function attachSentReply(
   const contactedStage = settings.stages.find((s) => /contact/i.test(s))
   const advanceStage = lead.stage === firstStage && contactedStage && contactedStage !== lead.stage
 
+  // The reply belongs to whichever of the lead's people it was sent to.
+  const recipients = email.to
+  const person = await prisma.person.findFirst({
+    where: { leadId: lead.id, email: { in: recipients } },
+  })
+
   await prisma.$transaction([
     prisma.thread.create({
       data: {
@@ -519,6 +602,7 @@ async function attachSentReply(
         direction: 'out',
         date: email.date,
         snippet: email.text.slice(0, 300),
+        personId: person?.id ?? null,
       },
     }),
     prisma.timelineEvent.create({
@@ -547,4 +631,84 @@ async function attachSentReply(
     }),
   ])
   return true
+}
+
+/**
+ * Attach one meeting from the transcript provider to every lead whose contact
+ * (lead email or any person on the profile) attended: stores the meeting with
+ * its AI dossier/tldr, adds each external attendee to the lead's people, and
+ * logs a `meeting` timeline event. Idempotent by (leadId, meeting id).
+ * Returns how many leads gained this meeting.
+ */
+async function attachMeeting(
+  prisma: PrismaClient,
+  workspaceId: string,
+  ambient: AmbientConfig,
+  meeting: AmbientMeeting,
+  ownAddress: string,
+  deps: ScanDeps,
+): Promise<number> {
+  const external = meeting.attendees.filter((a) => a.email && a.email !== ownAddress)
+  if (external.length === 0) return 0
+  const emails = external.map((a) => a.email)
+  const leads = await prisma.lead.findMany({
+    where: {
+      workspaceId,
+      deletedAt: null,
+      OR: [{ email: { in: emails } }, { people: { some: { email: { in: emails } } } }],
+    },
+    select: { id: true, lastTouchedAt: true },
+  })
+  if (leads.length === 0) return 0
+
+  let insight: AmbientInsight | null = null
+  let attached = 0
+  for (const lead of leads) {
+    const known = await prisma.meeting.findUnique({
+      where: { leadId_externalId: { leadId: lead.id, externalId: meeting.id } },
+    })
+    if (known) continue
+    if (!insight) {
+      insight = meeting.insightId
+        ? await deps.getMeetingInsight(ambient, meeting.insightId)
+        : { tldr: '', text: '' }
+    }
+    await prisma.$transaction([
+      prisma.meeting.create({
+        data: {
+          leadId: lead.id,
+          externalId: meeting.id,
+          title: meeting.title,
+          startsAt: meeting.startsAt,
+          endsAt: meeting.endsAt,
+          attendees: external.map((a) => ({ name: a.name, email: a.email, organizer: a.organizer })),
+          tldr: insight.tldr,
+          dossier: insight.text,
+          url: meeting.insightUrl,
+        },
+      }),
+      prisma.timelineEvent.create({
+        data: {
+          leadId: lead.id,
+          type: 'meeting',
+          actor: 'system',
+          detail: `Meeting: "${meeting.title}"`,
+          at: meeting.startsAt,
+        },
+      }),
+      ...(meeting.startsAt > lead.lastTouchedAt
+        ? [prisma.lead.update({ where: { id: lead.id }, data: { lastTouchedAt: meeting.startsAt } })]
+        : []),
+    ])
+    for (const attendee of external) {
+      await upsertPerson(prisma, lead.id, {
+        name: attendee.name,
+        email: attendee.email,
+        role: 'Meeting attendee',
+        seenAt: meeting.startsAt,
+      })
+    }
+    attached++
+  }
+  return attached
 }
