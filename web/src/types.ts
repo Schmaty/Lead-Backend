@@ -223,18 +223,25 @@ export interface ScanResult {
   at: string
   scanned: number
   imported: number
+  /** New emails merged into existing leads' conversations. */
+  merged: number
   updated: number
   skipped: number
+  /** Outbound replies detected in sent mail and attached to leads. */
+  replies: number
   errors: string[]
 }
 
 export interface ScanProgress {
-  phase: 'connecting' | 'scoring'
+  phase: 'connecting' | 'scoring' | 'replies'
+  /** Conversations to score, not raw emails. */
   total: number
   processed: number
   imported: number
+  merged: number
   updated: number
   skipped: number
+  replies: number
 }
 
 export interface ScanStatus {

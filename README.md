@@ -232,7 +232,13 @@ curl -s -X POST $API/api/v1/workspace/scan -H "authorization: Bearer $TOKEN"    
 curl -s $API/api/v1/workspace/scan/status -H "authorization: Bearer $TOKEN"    # → method, email, progress, last result
 ```
 
-Re-scans are idempotent — a lead is keyed by the email's Message-ID, so re-reading the same mail updates the AI fields but never duplicates, and the fields humans own (stage, owner, follow-up, notes, a win-probability override) always survive.
+### Conversations merge into one lead
+
+A lead is a **conversation**, not a single email. Messages thread together by their `References`/`In-Reply-To` headers (with a sender + "Re:"-subject fallback for clients that drop them), so when a prospect replies, the new email **merges into the same lead**: the message joins the lead's email thread, an `email_received` event lands on its timeline, and Claude re-assesses the deal *with the full exchange as context* — summary, scores, deal value, next step, and the draft reply all reflect where the conversation now stands. First-contact date and everything humans own (stage, owner, follow-up, notes, a win-probability override) are never touched by a merge.
+
+Your side of the conversation is tracked too: each scan also reads the account's **sent mail** and attaches your replies to the matching lead — the reply appears in the thread (outbound), `replySent` flips on, a `reply_sent` event hits the timeline, and a lead still sitting in the first stage auto-advances to the contacted stage (leads a human has already moved are left alone).
+
+Re-scans are idempotent — conversations are keyed by their thread root, already-seen messages are recognized (and spend no AI calls), nothing ever duplicates.
 
 ## Optional: push leads from an external tool
 

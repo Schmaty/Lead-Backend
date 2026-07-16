@@ -2,7 +2,7 @@ import type { PrismaClient } from '@prisma/client'
 import type { AppConfig } from '../../config.js'
 import { decryptSecret } from '../../crypto/secrets.js'
 import { AppError } from '../../middleware/errorHandler.js'
-import { upsertLeadByExternalId } from '../../services/leadUpsert.js'
+import { upsertLeadByExternalId, type UpsertThread } from '../../services/leadUpsert.js'
 import {
   getGoogleOauthClient,
   getPlatformAnthropicKey,
@@ -10,8 +10,13 @@ import {
 } from '../../services/platformCredentials.js'
 import { resolveSettings, type WorkspaceSettings } from '../../types/settings.js'
 import { googleOauth } from './googleOauth.js'
-import { fetchRecentEmails, type InboundEmail, type MailboxConfig } from './mailbox.js'
-import { createAnthropic, scoreEmail, type ScoredLead } from './scorer.js'
+import {
+  fetchRecentEmails,
+  fetchSentEmails,
+  type InboundEmail,
+  type MailboxConfig,
+} from './mailbox.js'
+import { createAnthropic, scoreEmail, type ConversationContext, type ScoredLead } from './scorer.js'
 
 /** Client sign-in path: value = Google refresh token, meta = { email, lastScanAt }. */
 export const GMAIL_OAUTH_KIND = 'GMAIL_OAUTH'
@@ -24,6 +29,8 @@ const DEFAULT_IMAP_HOST = 'imap.gmail.com'
 const DEFAULT_IMAP_PORT = 993
 /** Cap per scan so one run can't burn unbounded Anthropic spend. */
 const MAX_EMAILS_PER_SCAN = 25
+/** Sent mail costs no AI calls — a wider window keeps reply tracking complete. */
+const MAX_SENT_PER_SCAN = 50
 /** First-ever scan looks back this far. */
 const FIRST_SCAN_LOOKBACK_MS = 7 * 24 * 3600 * 1000
 /** Subsequent scans re-read a little history; the idempotent upsert dedupes. */
@@ -31,22 +38,33 @@ const RESCAN_OVERLAP_MS = 60 * 60 * 1000
 
 export interface ScanResult {
   at: string
+  /** Inbound emails read from the inbox. */
   scanned: number
+  /** New leads (new conversations). */
   imported: number
+  /** New emails merged into existing leads' conversations. */
+  merged: number
+  /** Conversations seen again with nothing new (overlap re-reads). */
   updated: number
+  /** Own-address inbox mail ignored. */
   skipped: number
+  /** Outbound replies detected in sent mail and attached to leads. */
+  replies: number
   errors: string[]
 }
 
 /** Live progress while a scan runs — what the dashboard banner renders. */
 export interface ScanProgress {
-  /** 'connecting' while the IMAP fetch runs; 'scoring' once emails are in hand. */
-  phase: 'connecting' | 'scoring'
+  /** 'connecting' during IMAP fetch; 'scoring' per conversation; 'replies' during the sent-mail pass. */
+  phase: 'connecting' | 'scoring' | 'replies'
+  /** Conversations to score (not raw emails). */
   total: number
   processed: number
   imported: number
+  merged: number
   updated: number
   skipped: number
+  replies: number
 }
 
 interface ScanState {
@@ -69,18 +87,21 @@ export function getScanState(workspaceId: string): ScanState {
 
 export interface ScanDeps {
   fetchEmails: (config: MailboxConfig, since: Date, limit: number) => Promise<InboundEmail[]>
+  fetchSentEmails: (config: MailboxConfig, since: Date, limit: number) => Promise<InboundEmail[]>
   scoreEmail: (
     apiKey: string,
     email: InboundEmail,
     settings: WorkspaceSettings,
     workspaceName: string,
+    context?: ConversationContext,
   ) => Promise<ScoredLead>
 }
 
 let defaultDeps: ScanDeps = {
   fetchEmails: fetchRecentEmails,
-  scoreEmail: (apiKey, email, settings, workspaceName) =>
-    scoreEmail(createAnthropic(apiKey), email, settings, workspaceName),
+  fetchSentEmails,
+  scoreEmail: (apiKey, email, settings, workspaceName, context) =>
+    scoreEmail(createAnthropic(apiKey), email, settings, workspaceName, context),
 }
 
 /** Test hook: swap the IMAP/Anthropic edges for fakes. Returns a restore fn. */
@@ -199,10 +220,59 @@ export async function resolveScanSetup(
   }
 }
 
+/** The message permalink — also each thread entry's identity for merge dedup. */
+const messageUrl = (messageId: string): string =>
+  `https://mail.google.com/mail/u/0/#search/rfc822msgid%3A${encodeURIComponent(messageId)}`
+
+const normalizeSubject = (subject: string): string =>
+  subject.replace(/^\s*((re|fwd?|fw)\s*:\s*)+/i, '').trim().toLowerCase()
+
+const isReplySubject = (subject: string): boolean => /^\s*(re|fwd?|fw)\s*:/i.test(subject)
+
+const asThread = (email: InboundEmail, direction: 'in' | 'out'): UpsertThread => ({
+  subject: email.subject,
+  url: messageUrl(email.messageId),
+  direction,
+  date: email.date,
+  snippet: email.text.slice(0, 300),
+})
+
 /**
- * Scan the workspace inbox: fetch new mail over IMAP, score each message with
- * Claude, and upsert leads (idempotent by Message-ID). Human edits and manual
- * winProbability overrides on existing leads survive re-scans.
+ * The conversation a message belongs to: the thread root from References /
+ * In-Reply-To when present; otherwise, for "Re:"-style replies from a known
+ * sender, the existing lead whose thread carries the same subject; otherwise
+ * the message stands alone (its own Message-ID starts a new conversation).
+ */
+async function resolveThreadKey(
+  prisma: PrismaClient,
+  workspaceId: string,
+  email: InboundEmail,
+): Promise<string> {
+  const root = email.references[0] ?? email.inReplyTo
+  if (root) return root
+  if (isReplySubject(email.subject)) {
+    const candidates = await prisma.lead.findMany({
+      where: { workspaceId, deletedAt: null, email: email.from.address, externalId: { not: null } },
+      include: { threads: { select: { subject: true } } },
+      take: 20,
+      orderBy: { lastTouchedAt: 'desc' },
+    })
+    const wanted = normalizeSubject(email.subject)
+    const match = candidates.find((lead) =>
+      lead.threads.some((thread) => normalizeSubject(thread.subject) === wanted),
+    )
+    if (match?.externalId) return match.externalId
+  }
+  return email.messageId
+}
+
+/**
+ * Scan the workspace inbox: fetch new mail over IMAP, group it into
+ * conversations, score each conversation with Claude (with prior context for
+ * known threads), and upsert leads — new threads become leads, replies merge
+ * into the lead they belong to. A second pass over sent mail attaches the
+ * team's own replies, marks replySent, and advances brand-new leads to the
+ * contacted stage. Human edits and manual winProbability overrides survive.
  */
 export async function runScan(
   prisma: PrismaClient,
@@ -223,7 +293,7 @@ export async function runScan(
 
   state.running = true
   state.lastError = undefined
-  const progress: ScanProgress = { phase: 'connecting', total: 0, processed: 0, imported: 0, updated: 0, skipped: 0 }
+  const progress: ScanProgress = { phase: 'connecting', total: 0, processed: 0, imported: 0, merged: 0, updated: 0, skipped: 0, replies: 0 }
   state.progress = progress
   const startedAt = new Date()
   try {
@@ -245,66 +315,136 @@ export async function runScan(
     }
 
     const emails = await deps.fetchEmails(mailbox, since, MAX_EMAILS_PER_SCAN)
-    progress.phase = 'scoring'
-    progress.total = emails.length
+    const result: ScanResult = { at: startedAt.toISOString(), scanned: emails.length, imported: 0, merged: 0, updated: 0, skipped: 0, replies: 0, errors: [] }
+    const ownAddress = credentials.email.toLowerCase()
 
-    const result: ScanResult = { at: startedAt.toISOString(), scanned: emails.length, imported: 0, updated: 0, skipped: 0, errors: [] }
+    // ── Group inbound mail into conversations ────────────────────────────────
+    const groups = new Map<string, InboundEmail[]>()
     for (const email of emails) {
       // Never score the workspace's own outbound mail that lands in INBOX.
-      if (email.from.address === credentials.email.toLowerCase()) {
+      if (email.from.address === ownAddress) {
         result.skipped++
-        progress.processed++
         progress.skipped++
         continue
       }
+      const key = await resolveThreadKey(prisma, workspaceId, email)
+      const group = groups.get(key)
+      if (group) group.push(email)
+      else groups.set(key, [email])
+    }
+    for (const group of groups.values()) group.sort((a, b) => a.date.getTime() - b.date.getTime())
+
+    progress.phase = 'scoring'
+    progress.total = groups.size
+
+    // ── Score each conversation and upsert its lead ──────────────────────────
+    for (const [threadKey, group] of groups) {
       try {
-        const scored = await deps.scoreEmail(credentials.anthropicApiKey, email, settings, workspace.name)
-        const spamStage = settings.stages.find((s) => /spam/i.test(s))
-        const { created } = await upsertLeadByExternalId(prisma, workspaceId, settings, {
-          externalId: email.messageId,
-          receivedAt: email.date,
-          name: scored.name || email.from.name || email.from.address,
-          email: email.from.address || 'unknown@unknown.invalid',
-          org: scored.org,
-          source: 'Email',
-          inquiryType: scored.inquiryType,
-          summary: scored.summary,
-          fitScore: scored.fitScore,
-          urgencyScore: scored.urgencyScore,
-          leadScore: scored.leadScore,
-          dealValueLow: scored.dealValueLow,
-          dealValueHigh: scored.dealValueHigh,
-          estPayoutRaw: scored.estPayoutRaw,
-          estWork: scored.estWork,
-          recommendedNextStep: scored.recommendedNextStep,
-          draftReply: scored.draftReply,
-          fitReasons: scored.fitReasons,
-          riskFlags: scored.riskFlags,
-          inferredFields: scored.inferredFields,
-          threads: [
-            {
-              subject: email.subject,
-              url: `https://mail.google.com/mail/u/0/#search/rfc822msgid%3A${encodeURIComponent(email.messageId)}`,
-              direction: 'in',
-              date: email.date,
-              snippet: email.text.slice(0, 300),
-            },
-          ],
-          initialStage: !scored.relevant && spamStage ? spamStage : 'New',
-          createdDetail: `Scanned from inbox (${email.from.address})`,
+        const existing = await prisma.lead.findUnique({
+          where: { workspaceId_externalId: { workspaceId, externalId: threadKey } },
+          include: { threads: { orderBy: { date: 'asc' } } },
         })
+
+        // Overlap re-read with nothing new → no AI call, nothing to change.
+        const knownUrls = new Set(existing?.threads.map((t) => t.url) ?? [])
+        if (existing && group.every((email) => knownUrls.has(messageUrl(email.messageId)))) {
+          result.updated++
+          progress.updated++
+          progress.processed++
+          continue
+        }
+
+        const newest = group[group.length - 1]!
+        const earlier = group.slice(0, -1)
+        const context: ConversationContext | undefined =
+          existing || earlier.length > 0
+            ? {
+                previousSummary: existing?.summary ?? '',
+                exchange: [
+                  ...(existing?.threads ?? []).map((thread) => ({
+                    direction: thread.direction as 'in' | 'out',
+                    date: thread.date,
+                    subject: thread.subject,
+                    snippet: thread.snippet,
+                  })),
+                  ...earlier.map((email) => ({
+                    direction: 'in' as const,
+                    date: email.date,
+                    subject: email.subject,
+                    snippet: email.text.slice(0, 800),
+                  })),
+                ],
+              }
+            : undefined
+
+        const scored = await deps.scoreEmail(credentials.anthropicApiKey, newest, settings, workspace.name, context)
+        const spamStage = settings.stages.find((s) => /spam/i.test(s))
+        const first = group[0]!
+        const { created, addedThreads } = await upsertLeadByExternalId(
+          prisma,
+          workspaceId,
+          settings,
+          {
+            externalId: threadKey,
+            receivedAt: existing ? existing.receivedAt : first.date,
+            name: scored.name || newest.from.name || newest.from.address,
+            email: newest.from.address || 'unknown@unknown.invalid',
+            org: scored.org,
+            source: 'Email',
+            inquiryType: scored.inquiryType,
+            summary: scored.summary,
+            fitScore: scored.fitScore,
+            urgencyScore: scored.urgencyScore,
+            leadScore: scored.leadScore,
+            dealValueLow: scored.dealValueLow,
+            dealValueHigh: scored.dealValueHigh,
+            estPayoutRaw: scored.estPayoutRaw,
+            estWork: scored.estWork,
+            recommendedNextStep: scored.recommendedNextStep,
+            draftReply: scored.draftReply,
+            fitReasons: scored.fitReasons,
+            riskFlags: scored.riskFlags,
+            inferredFields: scored.inferredFields,
+            threads: group.map((email) => asThread(email, 'in')),
+            initialStage: !scored.relevant && spamStage ? spamStage : 'New',
+            createdDetail: `Scanned from inbox (${newest.from.address})`,
+          },
+          { threadMode: 'merge' },
+        )
         if (created) {
           result.imported++
           progress.imported++
+        } else if (addedThreads > 0) {
+          result.merged++
+          progress.merged++
         } else {
           result.updated++
           progress.updated++
         }
       } catch (err) {
-        result.errors.push(`"${email.subject}": ${err instanceof Error ? err.message : String(err)}`)
+        result.errors.push(`"${group[0]!.subject}": ${err instanceof Error ? err.message : String(err)}`)
       } finally {
         progress.processed++
       }
+    }
+
+    // ── Track the team's own replies from sent mail ──────────────────────────
+    progress.phase = 'replies'
+    try {
+      const sent = await deps.fetchSentEmails(mailbox, since, MAX_SENT_PER_SCAN)
+      for (const email of sent) {
+        try {
+          const attached = await attachSentReply(prisma, workspaceId, settings, email)
+          if (attached) {
+            result.replies++
+            progress.replies++
+          }
+        } catch (err) {
+          result.errors.push(`sent "${email.subject}": ${err instanceof Error ? err.message : String(err)}`)
+        }
+      }
+    } catch (err) {
+      result.errors.push(`sent mailbox: ${err instanceof Error ? err.message : String(err)}`)
     }
 
     // Advance the scan cursor (merge — keep email/host in meta).
@@ -325,4 +465,86 @@ export async function runScan(
     state.running = false
     state.progress = undefined
   }
+}
+
+/**
+ * Attach one sent email to the lead whose conversation it answers: appends an
+ * outbound thread entry, marks replySent, logs the reply on the timeline, and
+ * advances a lead still in the first stage to the contacted stage. Returns
+ * false when the email doesn't belong to any tracked conversation (or was
+ * already recorded).
+ */
+async function attachSentReply(
+  prisma: PrismaClient,
+  workspaceId: string,
+  settings: WorkspaceSettings,
+  email: InboundEmail,
+): Promise<boolean> {
+  const root = email.references[0] ?? email.inReplyTo
+  let lead =
+    root != null
+      ? await prisma.lead.findUnique({
+          where: { workspaceId_externalId: { workspaceId, externalId: root } },
+          include: { threads: { select: { url: true } } },
+        })
+      : null
+  if (!lead && isReplySubject(email.subject) && email.to.length > 0) {
+    const wanted = normalizeSubject(email.subject)
+    const candidates = await prisma.lead.findMany({
+      where: { workspaceId, deletedAt: null, email: { in: email.to } },
+      include: { threads: { select: { url: true, subject: true } } },
+      take: 20,
+      orderBy: { lastTouchedAt: 'desc' },
+    })
+    lead =
+      candidates.find((candidate) =>
+        candidate.threads.some((thread) => normalizeSubject(thread.subject ?? '') === wanted),
+      ) ?? null
+  }
+  if (!lead) return false
+
+  const url = messageUrl(email.messageId)
+  if (lead.threads.some((thread) => thread.url === url)) return false
+
+  const firstStage = settings.stages[0]
+  const contactedStage = settings.stages.find((s) => /contact/i.test(s))
+  const advanceStage = lead.stage === firstStage && contactedStage && contactedStage !== lead.stage
+
+  await prisma.$transaction([
+    prisma.thread.create({
+      data: {
+        leadId: lead.id,
+        subject: email.subject,
+        url,
+        direction: 'out',
+        date: email.date,
+        snippet: email.text.slice(0, 300),
+      },
+    }),
+    prisma.timelineEvent.create({
+      data: { leadId: lead.id, type: 'reply_sent', actor: 'system', detail: `Reply sent: "${email.subject}"`, at: email.date },
+    }),
+    ...(advanceStage
+      ? [
+          prisma.timelineEvent.create({
+            data: {
+              leadId: lead.id,
+              type: 'stage_change',
+              actor: 'system',
+              detail: `Moved to ${contactedStage} — reply sent`,
+              at: email.date,
+            },
+          }),
+        ]
+      : []),
+    prisma.lead.update({
+      where: { id: lead.id },
+      data: {
+        replySent: true,
+        ...(advanceStage ? { stage: contactedStage } : {}),
+        ...(email.date > lead.lastTouchedAt ? { lastTouchedAt: email.date } : {}),
+      },
+    }),
+  ])
+  return true
 }

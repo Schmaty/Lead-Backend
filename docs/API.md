@@ -164,7 +164,7 @@ interface Lead {
 }
 ```
 
-Timeline event `type` values: `created`, `stage_change`, `owner_change`, `follow_up_set`, `note_added`, `reply_sent`, `win_probability_set`. `actor` is a user's display name or `"system"` (inbox scanner / ingest webhook).
+Timeline event `type` values: `created`, `stage_change`, `owner_change`, `follow_up_set`, `note_added`, `email_received`, `reply_sent`, `win_probability_set`. `actor` is a user's display name or `"system"` (inbox scanner / ingest webhook). The scanner writes `email_received` when a new inbound message merges into an existing conversation, and `reply_sent` / `stage_change` (actor `system`) when it notices one of your own replies in sent mail.
 
 ### Computed-field semantics
 
@@ -374,14 +374,22 @@ Non-developers get `403 { "error": "Requires the developer account" }` on all th
 
 ### Inbox scanning (the built-in pipeline)
 
-Once a mailbox is connected (`GMAIL_OAUTH`, or the `GMAIL_IMAP` fallback) **and** the platform Anthropic key exists, the server polls the mailbox on the `scanSettings.pollMinutes` cadence: it fetches mail newer than the last scan over IMAP (OAuth connections trade the refresh token for a short-lived XOAUTH2 access token per scan), scores each email with the Anthropic API (`claude-opus-4-8`, structured outputs — category, 0–10 fit/urgency/lead scores, deal-value estimate, next step, draft reply), and upserts a lead per email. The email's Message-ID is the `externalId`, so re-scans update rather than duplicate and human edits survive (§8 semantics). Irrelevant mail (newsletters, receipts, spam) is filed to the stage matching `/spam/i` — or dropped if no such stage exists; mail from the workspace's own address is skipped; at most 25 emails are scored per scan; the first scan looks back 7 days. A legacy per-workspace `ANTHROPIC_API_KEY` credential still works as an AI-key fallback for pre-platform installs.
+Once a mailbox is connected (`GMAIL_OAUTH`, or the `GMAIL_IMAP` fallback) **and** the platform Anthropic key exists, the server polls the mailbox on the `scanSettings.pollMinutes` cadence: it fetches mail newer than the last scan over IMAP (OAuth connections trade the refresh token for a short-lived XOAUTH2 access token per scan), groups it into **conversations** by `References`/`In-Reply-To` (falling back to sender + normalized "Re:" subject when those headers are missing), and scores each conversation with the Anthropic API (`claude-opus-4-8`, structured outputs — category, 0–10 fit/urgency/lead scores, deal-value estimate, next step, draft reply). The conversation's thread-root Message-ID is the lead's `externalId`:
+
+- A **new conversation** creates a lead (several same-thread messages in one scan still make one lead and one AI call).
+- A **reply to a known conversation** merges into its lead: the message is appended to the lead's threads, an `email_received` timeline event is written, and the re-score runs **with the prior exchange + previous summary as context** so the assessment reflects where the deal now stands. `receivedAt` (first contact) and all human-owned fields survive (§8 semantics).
+- **Already-seen messages** (the overlap window re-reads ~1h of history) are recognized by message identity and spend **no** AI calls.
+
+After the inbox pass, the scanner reads the account's **sent-mail folder** (found via the special-use `\Sent` flag) and attaches your own replies to the leads they answer: outbound thread entry, `replySent: true`, a `reply_sent` timeline event, and — only for leads still in the first pipeline stage — an automatic advance to the stage matching `/contact/i` with a `stage_change` event (actor `system`). Leads a human has moved are never touched.
+
+Irrelevant mail (newsletters, receipts, spam) is filed to the stage matching `/spam/i` — or dropped if no such stage exists; mail from the workspace's own address is skipped in the inbox pass; at most 25 inbound emails (and 50 sent) are read per scan; the first scan looks back 7 days. A legacy per-workspace `ANTHROPIC_API_KEY` credential still works as an AI-key fallback for pre-platform installs.
 
 | Call | Role | Returns |
 |---|---|---|
 | `POST /workspace/scan` | OWNER/ADMIN | `202 { started: true }` — the scan runs in the background. `400` if not configured, `409` if a scan is already running. Audited. |
-| `GET /workspace/scan/status` | any | `{ configured, method: "oauth"\|"imap"\|null, email, googleSignInAvailable, aiReady, running, progress, lastScanAt, pollMinutes, lastResult, lastError }` where `progress` (non-null only while running) = `{ phase: "connecting"\|"scoring", total, processed, imported, updated, skipped }` and `lastResult` = `{ at, scanned, imported, updated, skipped, errors: string[] }` |
+| `GET /workspace/scan/status` | any | `{ configured, method: "oauth"\|"imap"\|null, email, googleSignInAvailable, aiReady, running, progress, lastScanAt, pollMinutes, lastResult, lastError }` where `progress` (non-null only while running) = `{ phase: "connecting"\|"scoring"\|"replies", total, processed, imported, merged, updated, skipped, replies }` (`total` counts conversations, not raw emails) and `lastResult` = `{ at, scanned, imported, merged, updated, skipped, replies, errors: string[] }` |
 
-Status drives the whole Settings UI: `email` null → show "Sign in with Google" (disabled with a call-your-developer note when `googleSignInAvailable` is false); `email` set → show the connected mailbox + Disconnect; `aiReady` false → the developer hasn't stored the platform key yet. Frontend flow for "Scan now": POST, poll status every ~2 s rendering `progress` ("Scoring email 3 of 12…") until `running` is false, then show `lastResult`/`lastError` and refresh the lead list.
+Status drives the whole Settings UI: `email` null → show "Sign in with Google" (disabled with a call-your-developer note when `googleSignInAvailable` is false); `email` set → show the connected mailbox + Disconnect; `aiReady` false → the developer hasn't stored the platform key yet. Frontend flow for "Scan now": POST, poll status every ~2 s rendering `progress` ("Scoring conversation 3 of 12…", then "Checking sent mail…") until `running` is false, then show `lastResult`/`lastError` and refresh the lead list.
 
 ### API keys (developer-only) — for external tools → ingest auth (optional)
 
@@ -413,7 +421,7 @@ Payload (unknown extra fields are ignored):
 | `fitScore`, `urgencyScore`, `leadScore` | int 0–10 | ✔ | |
 | `dealValueLow`, `dealValueHigh` | number ≥ 0 | — | default 0 |
 | `fitReasons`, `riskFlags`, `inferredFields` | string[] | — | default `[]` |
-| `threads` | `[{ subject, url, direction: "in"\|"out", date, snippet }]` | — | replaces the stored set on every ingest |
+| `threads` | `[{ subject, url, direction: "in"\|"out", date, snippet }]` | — | replaces the stored set on every ingest (the webhook payload is authoritative; only the built-in scanner uses merge semantics) |
 
 Responses: `201 { id, created: true }` on first sight of an `externalId`; `200 { id, created: false }` on any re-run (the row is **updated, never duplicated** — sender retries are safe).
 

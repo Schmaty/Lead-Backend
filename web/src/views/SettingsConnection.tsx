@@ -81,7 +81,11 @@ export default function ConnectionTab(): ReactNode {
         if (pollRef.current) window.clearInterval(pollRef.current)
         pollRef.current = null
         if (status.lastError) desk.toast(`Scan failed: ${status.lastError}`)
-        else if (status.lastResult) desk.toast(`Scan complete — ${status.lastResult.imported} new, ${status.lastResult.updated} updated`)
+        else if (status.lastResult) {
+          const r = status.lastResult
+          const parts = [`${r.imported} new`, `${r.merged} merged`, ...(r.replies ? [`${r.replies} replies tracked`] : [])]
+          desk.toast(`Scan complete — ${parts.join(', ')}`)
+        }
         void desk.refreshLeads()
       }).catch(() => undefined)
     }, 2000)
@@ -166,14 +170,16 @@ export default function ConnectionTab(): ReactNode {
             </div>
             <div style={{ fontSize: 12, color: C.sub, marginTop: 2, lineHeight: 1.45 }}>
               {scan?.running
-                ? scan.progress && scan.progress.phase === 'scoring'
-                  ? scan.progress.total === 0
-                    ? 'Inbox read — no new mail in this window.'
-                    : `Scoring email ${Math.min(scan.progress.processed + 1, scan.progress.total)} of ${scan.progress.total} — ${scan.progress.imported} new, ${scan.progress.updated} updated${scan.progress.skipped ? `, ${scan.progress.skipped} skipped` : ''} so far`
-                  : 'Connecting to the inbox and reading new mail…'
+                ? scan.progress?.phase === 'replies'
+                  ? `Checking sent mail for your replies…${scan.progress.replies ? ` ${scan.progress.replies} tracked` : ''}`
+                  : scan.progress?.phase === 'scoring'
+                    ? scan.progress.total === 0
+                      ? 'Inbox read — no new mail in this window.'
+                      : `Scoring conversation ${Math.min(scan.progress.processed + 1, scan.progress.total)} of ${scan.progress.total} — ${scan.progress.imported} new, ${scan.progress.merged} merged${scan.progress.skipped ? `, ${scan.progress.skipped} skipped` : ''} so far`
+                    : 'Connecting to the inbox and reading new mail…'
                 : configured
                   ? scan?.lastScanAt
-                    ? `Last scan ${fmtDate(scan.lastScanAt)}${lastResult ? ` — ${lastResult.imported} new, ${lastResult.updated} updated, ${lastResult.skipped} skipped${lastResult.errors.length ? `, ${lastResult.errors.length} errors` : ''}` : ''}`
+                    ? `Last scan ${fmtDate(scan.lastScanAt)}${lastResult ? ` — ${lastResult.imported} new, ${lastResult.merged} merged into existing leads, ${lastResult.replies} replies tracked${lastResult.errors.length ? `, ${lastResult.errors.length} errors` : ''}` : ''}`
                     : 'Ready — the first scan reads the last 7 days of mail.'
                   : mailboxConnected && !scan?.aiReady
                     ? 'Mailbox connected. AI scoring isn’t enabled yet — your developer needs to finish platform setup.'

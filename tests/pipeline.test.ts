@@ -2,33 +2,44 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import type { FastifyInstance } from 'fastify'
 import type { InboundEmail, MailboxConfig } from '../src/modules/pipeline/mailbox.js'
 import { runScan, setScanDepsForTesting, type ScanDeps } from '../src/modules/pipeline/scanner.js'
-import { normalizeScoredLead, type ScoredLead } from '../src/modules/pipeline/scorer.js'
+import { normalizeScoredLead, type ConversationContext, type ScoredLead } from '../src/modules/pipeline/scorer.js'
 import { DEFAULT_SETTINGS } from '../src/types/settings.js'
 import { addMember, api, makeApp, resetDb, signup, testConfig, type Session } from './helpers.js'
 
 const MAILBOX_ADDRESS = 'inbox@fieldstone.example'
 
-const hotEmail: InboundEmail = {
+const email = (overrides: Partial<InboundEmail> & { messageId: string }): InboundEmail => ({
+  from: { name: 'Someone', address: 'someone@example.test' },
+  to: [MAILBOX_ADDRESS],
+  subject: '(no subject)',
+  date: new Date('2026-07-15T10:00:00Z'),
+  text: '',
+  references: [],
+  inReplyTo: null,
+  ...overrides,
+})
+
+const hotEmail = email({
   messageId: '<hot-1@mail.example>',
   from: { name: 'Dana Okafor', address: 'dana@northwind.example' },
   subject: 'AI training for our ops team',
   date: new Date('2026-07-15T10:00:00Z'),
   text: 'We want a 40-seat AI workshop, budget approved, starting next month.',
-}
-const spamEmail: InboundEmail = {
+})
+const spamEmail = email({
   messageId: '<spam-1@mail.example>',
   from: { name: 'MegaDeals', address: 'noreply@megadeals.example' },
   subject: 'HOT SUMMER DEALS INSIDE',
   date: new Date('2026-07-15T11:00:00Z'),
   text: 'Buy now! Unsubscribe here.',
-}
-const selfEmail: InboundEmail = {
+})
+const selfEmail = email({
   messageId: '<self-1@mail.example>',
   from: { name: 'Me', address: MAILBOX_ADDRESS },
   subject: 'Note to self',
   date: new Date('2026-07-15T12:00:00Z'),
   text: 'remember the thing',
-}
+})
 
 const scoredFor: Record<string, ScoredLead> = {
   [hotEmail.messageId]: {
@@ -71,13 +82,22 @@ const scoredFor: Record<string, ScoredLead> = {
   },
 }
 
-function fakeDeps(emails: InboundEmail[], sinceLog: Date[] = []): ScanDeps {
+interface FakeDepOptions {
+  sent?: InboundEmail[]
+  sinceLog?: Date[]
+  /** Records every scoring call: which email, with what conversation context. */
+  scoreCalls?: Array<{ messageId: string; context?: ConversationContext }>
+}
+
+function fakeDeps(emails: InboundEmail[], options: FakeDepOptions = {}): ScanDeps {
   return {
     fetchEmails: async (_config: MailboxConfig, since: Date) => {
-      sinceLog.push(since)
+      options.sinceLog?.push(since)
       return emails
     },
-    scoreEmail: async (_apiKey, email) => {
+    fetchSentEmails: async () => options.sent ?? [],
+    scoreEmail: async (_apiKey, email, _settings, _workspaceName, context) => {
+      options.scoreCalls?.push({ messageId: email.messageId, context })
       const scored = scoredFor[email.messageId]
       if (!scored) throw new Error(`no fake score for ${email.messageId}`)
       return scored
@@ -184,10 +204,13 @@ describe('runScan', () => {
     expect(detail.json().timeline[0].detail).toContain('Scanned from inbox')
   })
 
-  it('is idempotent: re-scanning the same mail updates instead of duplicating', async () => {
-    const result = await runScan(app.prisma, testConfig(), owner.workspace.id, fakeDeps([hotEmail, spamEmail]))
+  it('is idempotent: re-scanning the same mail changes nothing and spends no AI calls', async () => {
+    const scoreCalls: Array<{ messageId: string; context?: ConversationContext }> = []
+    const result = await runScan(app.prisma, testConfig(), owner.workspace.id, fakeDeps([hotEmail, spamEmail], { scoreCalls }))
     expect(result.imported).toBe(0)
     expect(result.updated).toBe(2)
+    // Every message was already stored — no re-scoring needed.
+    expect(scoreCalls).toHaveLength(0)
 
     const list = await api(app, owner, { method: 'GET', url: '/api/v1/leads?pageSize=50' })
     expect(list.json().total).toBe(2)
@@ -215,7 +238,7 @@ describe('runScan', () => {
     expect(Number.isNaN(lastScanAt.getTime())).toBe(false)
 
     const sinceLog: Date[] = []
-    await runScan(app.prisma, testConfig(), owner.workspace.id, fakeDeps([], sinceLog))
+    await runScan(app.prisma, testConfig(), owner.workspace.id, fakeDeps([], { sinceLog }))
     expect(sinceLog).toHaveLength(1)
     expect(sinceLog[0]!.getTime()).toBeLessThan(lastScanAt.getTime()) // overlap
     expect(sinceLog[0]!.getTime()).toBeGreaterThan(lastScanAt.getTime() - 2 * 3600 * 1000)
@@ -234,6 +257,7 @@ describe('scan route flow', () => {
   it('reports live per-email progress while a scan runs', async () => {
     const slowDeps: ScanDeps = {
       fetchEmails: async () => [hotEmail, spamEmail],
+      fetchSentEmails: async () => [],
       scoreEmail: async (_key, email) => {
         await new Promise((resolve) => setTimeout(resolve, 250))
         return scoredFor[email.messageId]!
@@ -285,6 +309,188 @@ describe('scan route flow', () => {
     } finally {
       restore()
     }
+  })
+})
+
+describe('conversation merging & progress tracking', () => {
+  const danaReply = email({
+    messageId: '<hot-2@mail.example>',
+    from: { name: 'Dana Okafor', address: 'dana@northwind.example' },
+    subject: 'Re: AI training for our ops team',
+    date: new Date('2026-07-16T09:00:00Z'),
+    text: 'Great — the 22nd works. Can you send a proposal for the 40 seats?',
+    references: ['<hot-1@mail.example>'],
+    inReplyTo: '<hot-1@mail.example>',
+  })
+  const patFirst = email({
+    messageId: '<pat-1@mail.example>',
+    from: { name: 'Pat Ibarra', address: 'pat@harborlight.example' },
+    subject: 'Team enablement help',
+    date: new Date('2026-07-16T10:00:00Z'),
+    text: 'Looking for AI enablement for a 12-person team.',
+  })
+  const patSecond = email({
+    messageId: '<pat-2@mail.example>',
+    from: { name: 'Pat Ibarra', address: 'pat@harborlight.example' },
+    subject: 'Re: Team enablement help',
+    date: new Date('2026-07-16T10:30:00Z'),
+    text: 'Forgot to add: budget is around $5k and we want this before September.',
+    references: ['<pat-1@mail.example>'],
+    inReplyTo: '<pat-1@mail.example>',
+  })
+
+  beforeAll(() => {
+    scoredFor[danaReply.messageId] = {
+      ...scoredFor[hotEmail.messageId]!,
+      summary: 'Date agreed (the 22nd); Dana asked for a proposal for 40 seats.',
+      recommendedNextStep: 'Send the proposal today.',
+      urgencyScore: 9,
+    }
+    scoredFor[patSecond.messageId] = {
+      ...scoredFor[hotEmail.messageId]!,
+      name: 'Pat Ibarra',
+      org: 'Harborlight',
+      summary: '12-person AI enablement, ~$5k budget, wants delivery before September.',
+      leadScore: 7,
+      dealValueLow: 4000,
+      dealValueHigh: 6000,
+    }
+  })
+
+  it('a reply merges into the existing lead and re-scores with conversation context', async () => {
+    const before = (await api(app, owner, { method: 'GET', url: '/api/v1/leads?pageSize=50' })).json().total
+    const scoreCalls: Array<{ messageId: string; context?: ConversationContext }> = []
+    const result = await runScan(app.prisma, testConfig(), owner.workspace.id, fakeDeps([danaReply], { scoreCalls }))
+    expect(result.imported).toBe(0)
+    expect(result.merged).toBe(1)
+
+    // No new lead — the reply landed on the existing one.
+    const list = await api(app, owner, { method: 'GET', url: '/api/v1/leads?pageSize=50' })
+    expect(list.json().total).toBe(before)
+
+    const hot = list.json().items.find((l: { externalId: string }) => l.externalId === hotEmail.messageId)
+    const detail = (await api(app, owner, { method: 'GET', url: `/api/v1/leads/${hot.id}` })).json()
+    expect(detail.threads).toHaveLength(2)
+    // AI fields updated from the full conversation; human edits untouched.
+    expect(detail.summary).toContain('proposal')
+    expect(detail.stage).toBe('Contacted')
+    expect(detail.notes).toBe('called them')
+    expect(new Date(detail.receivedAt).toISOString()).toBe(hotEmail.date.toISOString())
+    // lastTouchedAt reflects the most recent activity (a human PATCH bumped it
+    // past the reply's date in an earlier test — merge never rolls it back).
+    expect(new Date(detail.lastTouchedAt).getTime()).toBeGreaterThanOrEqual(danaReply.date.getTime())
+    expect(detail.timeline.some((e: { type: string }) => e.type === 'email_received')).toBe(true)
+
+    // The scorer saw the earlier exchange, not just the reply.
+    expect(scoreCalls).toHaveLength(1)
+    expect(scoreCalls[0]!.messageId).toBe(danaReply.messageId)
+    expect(scoreCalls[0]!.context?.previousSummary).toContain('40-seat')
+    expect(scoreCalls[0]!.context?.exchange.length).toBeGreaterThan(0)
+  })
+
+  it('several same-thread emails in one scan become one lead and one AI call', async () => {
+    const scoreCalls: Array<{ messageId: string; context?: ConversationContext }> = []
+    const result = await runScan(
+      app.prisma,
+      testConfig(),
+      owner.workspace.id,
+      fakeDeps([patFirst, patSecond], { scoreCalls }),
+    )
+    expect(result.imported).toBe(1)
+
+    expect(scoreCalls).toHaveLength(1)
+    expect(scoreCalls[0]!.messageId).toBe(patSecond.messageId)
+    expect(scoreCalls[0]!.context?.exchange).toHaveLength(1)
+
+    const list = await api(app, owner, { method: 'GET', url: '/api/v1/leads?pageSize=50' })
+    const pat = list.json().items.find((l: { externalId: string }) => l.externalId === patFirst.messageId)
+    const detail = (await api(app, owner, { method: 'GET', url: `/api/v1/leads/${pat.id}` })).json()
+    expect(detail.threads).toHaveLength(2)
+    expect(detail.summary).toContain('$5k')
+  })
+
+  it('a "Re:" without References still finds its conversation by sender + subject', async () => {
+    const bareReply = email({
+      messageId: '<hot-3@mail.example>',
+      from: { name: 'Dana Okafor', address: 'dana@northwind.example' },
+      subject: 'RE: AI training for our ops team',
+      date: new Date('2026-07-16T15:00:00Z'),
+      text: 'One more thing — can we add an exec briefing?',
+    })
+    scoredFor[bareReply.messageId] = scoredFor[danaReply.messageId]!
+    const result = await runScan(app.prisma, testConfig(), owner.workspace.id, fakeDeps([bareReply]))
+    expect(result.merged).toBe(1)
+    expect(result.imported).toBe(0)
+
+    const list = await api(app, owner, { method: 'GET', url: '/api/v1/leads?pageSize=50' })
+    const hot = list.json().items.find((l: { externalId: string }) => l.externalId === hotEmail.messageId)
+    const detail = (await api(app, owner, { method: 'GET', url: `/api/v1/leads/${hot.id}` })).json()
+    expect(detail.threads).toHaveLength(3)
+  })
+
+  it('a fresh subject from a known sender starts a new lead, not a merge', async () => {
+    const fresh = email({
+      messageId: '<dana-new-1@mail.example>',
+      from: { name: 'Dana Okafor', address: 'dana@northwind.example' },
+      subject: 'Different question about coaching',
+      date: new Date('2026-07-16T16:00:00Z'),
+      text: 'Separately — do you do 1:1 exec coaching?',
+    })
+    scoredFor[fresh.messageId] = { ...scoredFor[hotEmail.messageId]!, summary: 'Asks about 1:1 exec coaching.' }
+    const result = await runScan(app.prisma, testConfig(), owner.workspace.id, fakeDeps([fresh]))
+    expect(result.imported).toBe(1)
+    expect(result.merged).toBe(0)
+  })
+
+  it('sent mail attaches as an outbound reply: replySent, timeline, and stage advance', async () => {
+    const ourReply = email({
+      messageId: '<out-1@mail.example>',
+      from: { name: 'Fieldstone', address: MAILBOX_ADDRESS },
+      to: ['pat@harborlight.example'],
+      subject: 'Re: Team enablement help',
+      date: new Date('2026-07-16T17:00:00Z'),
+      text: 'Happy to help — how about a call Thursday?',
+      references: ['<pat-1@mail.example>'],
+      inReplyTo: '<pat-2@mail.example>',
+    })
+    const result = await runScan(app.prisma, testConfig(), owner.workspace.id, fakeDeps([], { sent: [ourReply] }))
+    expect(result.replies).toBe(1)
+
+    const list = await api(app, owner, { method: 'GET', url: '/api/v1/leads?pageSize=50' })
+    const pat = list.json().items.find((l: { externalId: string }) => l.externalId === patFirst.messageId)
+    const detail = (await api(app, owner, { method: 'GET', url: `/api/v1/leads/${pat.id}` })).json()
+    expect(detail.replySent).toBe(true)
+    expect(detail.stage).toBe('Contacted') // auto-advanced from New
+    expect(detail.threads).toHaveLength(3)
+    expect(detail.threads.some((t: { direction: string }) => t.direction === 'out')).toBe(true)
+    expect(detail.timeline.some((e: { type: string; actor: string }) => e.type === 'reply_sent' && e.actor === 'system')).toBe(true)
+
+    // Re-running the same sent mail is a no-op.
+    const again = await runScan(app.prisma, testConfig(), owner.workspace.id, fakeDeps([], { sent: [ourReply] }))
+    expect(again.replies).toBe(0)
+    const after = (await api(app, owner, { method: 'GET', url: `/api/v1/leads/${pat.id}` })).json()
+    expect(after.threads).toHaveLength(3)
+  })
+
+  it('does not auto-advance a stage a human already moved', async () => {
+    const ourReply = email({
+      messageId: '<out-2@mail.example>',
+      from: { name: 'Fieldstone', address: MAILBOX_ADDRESS },
+      to: ['dana@northwind.example'],
+      subject: 'Re: AI training for our ops team',
+      date: new Date('2026-07-16T18:00:00Z'),
+      text: 'Proposal attached.',
+      references: ['<hot-1@mail.example>'],
+    })
+    const list = await api(app, owner, { method: 'GET', url: '/api/v1/leads?pageSize=50' })
+    const hot = list.json().items.find((l: { externalId: string }) => l.externalId === hotEmail.messageId)
+    await api(app, owner, { method: 'PATCH', url: `/api/v1/leads/${hot.id}`, payload: { stage: 'Qualified' } })
+
+    const result = await runScan(app.prisma, testConfig(), owner.workspace.id, fakeDeps([], { sent: [ourReply] }))
+    expect(result.replies).toBe(1)
+    const detail = (await api(app, owner, { method: 'GET', url: `/api/v1/leads/${hot.id}` })).json()
+    expect(detail.stage).toBe('Qualified') // human-owned; only New leads auto-advance
+    expect(detail.replySent).toBe(true)
   })
 })
 

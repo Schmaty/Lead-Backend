@@ -185,9 +185,12 @@ describe('Gmail connect (sign-in) flow', () => {
     const email: InboundEmail = {
       messageId: '<oauth-1@mail.example>',
       from: { name: 'Pat Suarez', address: 'pat@prospect.example' },
+      to: ['inbox@client.test'],
       subject: 'Consulting inquiry',
       date: new Date('2026-07-15T09:00:00Z'),
       text: 'We need help with an AI rollout.',
+      references: [],
+      inReplyTo: null,
     }
     const scored: ScoredLead = {
       relevant: true,
@@ -222,6 +225,7 @@ describe('Gmail connect (sign-in) flow', () => {
         seen.push(mailbox)
         return [email]
       },
+      fetchSentEmails: async () => [],
       scoreEmail: async () => scored,
     })
     try {

@@ -42,6 +42,13 @@ export function createAnthropic(apiKey: string): Anthropic {
   return new Anthropic({ apiKey })
 }
 
+/** Prior state of an ongoing conversation, so re-scores assess the deal as it now stands. */
+export interface ConversationContext {
+  previousSummary: string
+  /** Recent exchange, oldest first. Includes both sides ('in' = the lead, 'out' = the business). */
+  exchange: Array<{ direction: 'in' | 'out'; date: Date; subject: string; snippet: string }>
+}
+
 function buildSystemPrompt(settings: WorkspaceSettings, workspaceName: string): string {
   return [
     `You score inbound email inquiries for "${workspaceName}", a small business that tracks its sales leads in a CRM.`,
@@ -50,22 +57,38 @@ function buildSystemPrompt(settings: WorkspaceSettings, workspaceName: string): 
     'Scores are integers 0-10. Deal values are USD estimates for the full engagement; use 0/0 when the email gives no basis for a number.',
     'Anything you estimate without direct evidence in the email belongs in inferredFields.',
     'Mark relevant=false for anything that is not a genuine potential-client inquiry (newsletters, receipts, automated mail, spam, vendors selling TO the business). Still fill in the other fields as best you can.',
+    'When conversation history is provided, this is an ongoing exchange: assess the deal as it NOW stands (not just the latest email), update the summary to say where things stand, set recommendedNextStep to the next move in this conversation, and write draftReply as the next reply in-thread.',
   ].join('\n')
 }
 
-function buildEmailBlock(email: InboundEmail): string {
+const EXCHANGE_LIMIT = 8
+
+function buildEmailBlock(email: InboundEmail, context?: ConversationContext): string {
   const body = email.text.length > 6000 ? `${email.text.slice(0, 6000)}\n…[truncated]` : email.text
-  return [
+  const parts: string[] = []
+  if (context) {
+    parts.push('=== CONVERSATION SO FAR ===')
+    if (context.previousSummary) parts.push(`Previous assessment: ${context.previousSummary}`, '')
+    for (const message of context.exchange.slice(-EXCHANGE_LIMIT)) {
+      const who = message.direction === 'in' ? 'THEM' : 'US'
+      const text = message.snippet.length > 800 ? `${message.snippet.slice(0, 800)}…` : message.snippet
+      parts.push(`[${who} · ${message.date.toISOString()}] ${message.subject}`, text, '')
+    }
+    parts.push('=== LATEST EMAIL (assess the conversation as it now stands) ===')
+  }
+  parts.push(
     `From: ${email.from.name ? `${email.from.name} <${email.from.address}>` : email.from.address}`,
     `Subject: ${email.subject}`,
     `Date: ${email.date.toISOString()}`,
     '',
     body,
-  ].join('\n')
+  )
+  return parts.join('\n')
 }
 
 /**
- * Score one inbound email with Claude. Structured outputs guarantee the shape;
+ * Score one inbound email with Claude — with the conversation so far when the
+ * email continues a known thread. Structured outputs guarantee the shape;
  * inquiryType is clamped to the workspace's configured list afterwards.
  */
 export async function scoreEmail(
@@ -73,13 +96,14 @@ export async function scoreEmail(
   email: InboundEmail,
   settings: WorkspaceSettings,
   workspaceName: string,
+  context?: ConversationContext,
 ): Promise<ScoredLead> {
   const response = await client.messages.parse({
     model: SCORER_MODEL,
     max_tokens: 16000,
     thinking: { type: 'adaptive' },
     system: buildSystemPrompt(settings, workspaceName),
-    messages: [{ role: 'user', content: buildEmailBlock(email) }],
+    messages: [{ role: 'user', content: buildEmailBlock(email, context) }],
     output_config: { format: zodOutputFormat(scoredLeadSchema) },
   })
   const parsed = response.parsed_output
