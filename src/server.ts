@@ -1,5 +1,6 @@
 import { buildApp } from './app.js'
 import { loadConfig } from './config.js'
+import { startScanScheduler } from './modules/pipeline/scheduler.js'
 
 async function main(): Promise<void> {
   let config
@@ -28,6 +29,12 @@ async function main(): Promise<void> {
   }
   process.on('SIGTERM', () => void shutdown('SIGTERM'))
   process.on('SIGINT', () => void shutdown('SIGINT'))
+
+  // Built-in inbox scanning: polls each configured workspace's mailbox on its
+  // scanSettings.pollMinutes cadence. Wired before listen() — Fastify rejects
+  // addHook once the instance is listening.
+  const stopScheduler = startScanScheduler(app)
+  app.addHook('onClose', async () => stopScheduler())
 
   try {
     await app.listen({ host: config.host, port: config.port })

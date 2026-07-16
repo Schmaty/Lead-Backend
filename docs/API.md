@@ -131,7 +131,7 @@ Returned by every lead endpoint. Fields marked ⚙ are computed server-side; ✍
 ```ts
 interface Lead {
   id: string
-  externalId: string | null      // n8n thread id (null for manually added leads)
+  externalId: string | null      // email Message-ID / external id (null for manually added leads)
   receivedAt: string             // ISO date the inquiry arrived
   name: string; email: string; org: string
   source: string                 // e.g. "Website form" | "Email" | "Referral" | "Event" | "Other"
@@ -163,7 +163,7 @@ interface Lead {
 }
 ```
 
-Timeline event `type` values: `created`, `stage_change`, `owner_change`, `follow_up_set`, `note_added`, `reply_sent`, `win_probability_set`. `actor` is a user's display name or `"system"` (ingest).
+Timeline event `type` values: `created`, `stage_change`, `owner_change`, `follow_up_set`, `note_added`, `reply_sent`, `win_probability_set`. `actor` is a user's display name or `"system"` (inbox scanner / ingest webhook).
 
 ### Computed-field semantics
 
@@ -322,14 +322,19 @@ Send any subset of:
 | `wonStage` / `lostStage` | string | must be in `stages`; drive win-rate analytics |
 | `sources` / `inquiryTypes` | `string[]` | pick-lists for the UI |
 | `notificationThresholds` | `{ hotLeadScore: 0–10 }` | stored for the dashboard's use |
-| `scanSettings` | `{ pollMinutes: 1–1440 }` | stored for the pipeline's use |
+| `scanSettings` | `{ pollMinutes: 1–1440 }` | cadence of the built-in inbox scanner (see below) |
 | `staleDays` | int 1–365 | stored for the dashboard's use |
 | `stageRenames` | `[{ from, to }, …]` | applied **before** the rest of the patch: renames the stage in `stages`/`closedStages`/`wonStage`/`lostStage` **and** on every lead carrying the old name, atomically, without timeline noise. `from` must exist; `to` must not collide. |
 
 → `{ settings, recomputedLeads, renamedStages }` (`recomputedLeads` = how many leads changed). Unknown keys → 400. Audited.
 
 ### Credentials (OWNER/ADMIN) — integration secrets, encrypted at rest
-Kinds: `ANTHROPIC_API_KEY` · `GMAIL_OAUTH` · `N8N_WEBHOOK` · `GOOGLE_SHEET`.
+
+| Kind | `value` (encrypted) | `meta` (plain JSON) | Used for |
+|---|---|---|---|
+| `GMAIL_IMAP` | the Gmail **app password** (Google Account → Security → 2-Step Verification → App passwords) | `{ email, host?, port?, lastScanAt? }` — `email` is required; `host`/`port` default to `imap.gmail.com:993`; `lastScanAt` is maintained by the scanner | the inbox the built-in scanner reads |
+| `ANTHROPIC_API_KEY` | an Anthropic API key | — | scoring each scanned email with Claude |
+| `N8N_WEBHOOK` | a shared signing secret | — | optional HMAC verification on the ingest webhook (§8) |
 
 | Call | Body | Returns |
 |---|---|---|
@@ -337,9 +342,22 @@ Kinds: `ANTHROPIC_API_KEY` · `GMAIL_OAUTH` · `N8N_WEBHOOK` · `GOOGLE_SHEET`.
 | `PUT /workspace/credentials/:kind` | `{ value, meta? }` | `{ kind, maskedValue, meta, updatedAt }` — upsert = rotation |
 | `DELETE /workspace/credentials/:kind` | — | `{ ok: true }` (404 if absent) |
 
-**The raw secret is never returned by any endpoint** — only masked (`sk-…0042`). Values are AES-256-GCM-encrypted in the database. The frontend should treat these as write-only: show the mask, offer "replace" and "delete". Storing an `N8N_WEBHOOK` secret arms HMAC verification on ingest (if enabled server-side, §8).
+**The raw secret is never returned by any endpoint** — only masked (`sk-…0042`). Values are AES-256-GCM-encrypted in the database. The frontend should treat these as write-only: show the mask, offer "replace" and "delete".
 
-### API keys (OWNER/ADMIN) — for n8n → ingest auth
+### Inbox scanning (the built-in pipeline)
+
+Once `GMAIL_IMAP` **and** `ANTHROPIC_API_KEY` are stored, the server polls the mailbox on the `scanSettings.pollMinutes` cadence: it fetches mail newer than the last scan over IMAP, scores each email with the Anthropic API (`claude-opus-4-8`, structured outputs — category, 0–10 fit/urgency/lead scores, deal-value estimate, next step, draft reply), and upserts a lead per email. The email's Message-ID is the `externalId`, so re-scans update rather than duplicate and human edits survive (§8 semantics). Irrelevant mail (newsletters, receipts, spam) is filed to the stage matching `/spam/i` — or dropped if no such stage exists; mail from the workspace's own address is skipped; at most 25 emails are scored per scan; the first scan looks back 7 days.
+
+| Call | Role | Returns |
+|---|---|---|
+| `POST /workspace/scan` | OWNER/ADMIN | `202 { started: true }` — the scan runs in the background. `400` if the two credentials aren't stored, `409` if a scan is already running. Audited. |
+| `GET /workspace/scan/status` | any | `{ configured, running, lastScanAt, pollMinutes, lastResult, lastError }` where `lastResult` = `{ at, scanned, imported, updated, skipped, errors: string[] }` |
+
+Frontend flow for a "Scan now" button: POST, then poll status every ~2 s until `running` is false, then show `lastResult`/`lastError` and refresh the lead list.
+
+### API keys (OWNER/ADMIN) — for external tools → ingest auth (optional)
+
+Not needed for inbox scanning — only for something outside Leadline pushing leads to §8.
 
 | Call | Body | Returns |
 |---|---|---|
@@ -347,19 +365,19 @@ Kinds: `ANTHROPIC_API_KEY` · `GMAIL_OAUTH` · `N8N_WEBHOOK` · `GOOGLE_SHEET`.
 | `POST /workspace/api-keys` | `{ name }` | `201 { id, name, prefix, key, warning }` — **`key` appears here once and never again** |
 | `DELETE /workspace/api-keys/:id` | — | `{ ok: true }` — revocation is immediate |
 
-Frontend: on create, show the full key in a copy-once dialog; afterwards only `prefix` (first 8 chars) identifies it. `lastUsedAt` is the "is n8n alive?" signal. Only the SHA-256 hash is stored server-side.
+Frontend: on create, show the full key in a copy-once dialog; afterwards only `prefix` (first 8 chars) identifies it. `lastUsedAt` is the "is the external pusher alive?" signal. Only the SHA-256 hash is stored server-side.
 
 ---
 
 ## 8. Ingest webhook (`POST /api/v1/ingest/leads`)
 
-**Machine-to-machine only** — authenticated by `x-api-key: <full key>` (not user auth, no cookie, no Bearer). The key resolves the workspace; rate limit 600/min per key; body limit 1 MiB.
+**Machine-to-machine only, and optional** — the built-in inbox scanner (§7) covers the normal path; this endpoint exists for external scripts or tools that produce already-scored leads. Authenticated by `x-api-key: <full key>` (not user auth, no cookie, no Bearer). The key resolves the workspace; rate limit 600/min per key; body limit 1 MiB. The scanner and this webhook share the same upsert, so both write identical leads.
 
 Payload (unknown extra fields are ignored):
 
 | Field | Type | Required | Notes |
 |---|---|---|---|
-| `externalId` | string | ✔ | n8n thread/message id — the idempotency key |
+| `externalId` | string | ✔ | any stable id for the source email/record — the idempotency key (the built-in scanner uses the email Message-ID) |
 | `receivedAt` | ISO date | ✔ | |
 | `name`, `email` | string | ✔ | email must be valid |
 | `source`, `inquiryType` | string | ✔ | |
@@ -369,7 +387,7 @@ Payload (unknown extra fields are ignored):
 | `fitReasons`, `riskFlags`, `inferredFields` | string[] | — | default `[]` |
 | `threads` | `[{ subject, url, direction: "in"\|"out", date, snippet }]` | — | replaces the stored set on every ingest |
 
-Responses: `201 { id, created: true }` on first sight of an `externalId`; `200 { id, created: false }` on any re-run (the row is **updated, never duplicated** — n8n retries are safe).
+Responses: `201 { id, created: true }` on first sight of an `externalId`; `200 { id, created: false }` on any re-run (the row is **updated, never duplicated** — sender retries are safe).
 
 **Update semantics on re-ingest:** AI fields (scores, summary, deal values, draft, arrays, threads) are overwritten and tier/winProbability/expectedValue recomputed — but the human-owned fields (`stage`, `ownerId`, `followUpDate`, `notes`, `replySent`, and a manual `winProbability` override) are preserved. A `created` timeline event (actor `system`) is written only on first insert.
 
@@ -391,5 +409,6 @@ Responses: `201 { id, created: true }` on first sight of an `externalId`; `200 {
 | analytics page | `GET /analytics?from&to` |
 | team management | `GET /workspace/users` · `POST /auth/invite` · `POST /auth/accept-invite` |
 | integrations page | `GET/PUT/DELETE /workspace/credentials/:kind` · `GET/POST/DELETE /workspace/api-keys` |
+| inbox scanning | `POST /workspace/scan` · `GET /workspace/scan/status` |
 
 A ready-to-paste `apiDataService.ts` wrapper (with the 401-refresh-retry loop) is in the [README](../README.md#point-the-dashboard-at-it).

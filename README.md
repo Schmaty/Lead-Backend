@@ -1,22 +1,23 @@
 # Leadline
 
-Self-hosted, multi-tenant lead desk: the **Leadline API** (stores, secures and serves the leads an n8n + Anthropic pipeline scores from Gmail) plus the **Leadline dashboard** (the "Lead Desk" web app in [web/](web/)) that the team uses to read, triage and work those leads.
+Self-hosted, multi-tenant lead desk: the **Leadline API** (reads your Gmail inbox on a schedule, scores each inquiry with Claude, and stores everything in its own Postgres database) plus the **Leadline dashboard** (the "Lead Desk" web app in [web/](web/)) that the team uses to read, triage and work those leads.
 
 ```
-┌────────┐   ┌──────────────────────┐   ┌─────────────────────────┐   ┌────────────────────┐
-│ Gmail  │ → │ n8n + Anthropic      │ → │ Leadline API + Postgres │ → │ Leadline dashboard │
-│        │   │ (ingests & scores)   │   │ (stores, secures,       │   │ (web/ — served by  │
-│        │   │ POST /ingest/leads   │   │  serves)                │   │  the web service)  │
-└────────┘   └──────────────────────┘   └─────────────────────────┘   └────────────────────┘
+┌────────┐   ┌───────────────────────────────────────┐   ┌────────────────────┐
+│ Gmail  │ → │ Leadline API + Postgres               │ → │ Leadline dashboard │
+│ (IMAP) │   │ built-in scanner polls the inbox,     │   │ (web/ — served by  │
+│        │   │ scores each email with the Anthropic  │   │  the web service)  │
+│        │   │ API, and upserts leads into Postgres  │   │                    │
+└────────┘   └───────────────────────────────────────┘   └────────────────────┘
 ```
 
 - **Multi-tenant:** every business row belongs to a `Workspace`; every query is workspace-scoped. One deployment can serve multiple client businesses with isolated data.
-- **Store-and-serve only:** no AI scoring happens here (that stays in n8n). No billing, no websockets — a clean, secure v1 (the dashboard polls).
+- **Self-contained pipeline:** the scanner, the AI scoring, and the database all live in this one service — no n8n, no Google Sheets, no external workflow tool. An optional [ingest webhook](#optional-push-leads-from-an-external-tool) exists for anything outside Leadline that wants to push leads in.
 - **Portable by design:** Docker + config-only. Moving from the home server to a cloud VM later requires no code changes (see [Cloud migration](#cloud-migration-checklist)).
 
 **Stack:** Node.js 20 · TypeScript · Fastify 5 · Prisma 6 · PostgreSQL 16 · React 19 + Vite (dashboard) · Docker Compose · Caddy or Cloudflare Tunnel at the edge.
 
-**The dashboard** implements the full Lead Desk design: a Today briefing (morning brief, KPIs, needs-attention queue, funnel/source/score charts), a drag-and-drop Pipeline board, the All Leads table (filters, presets, search-in-URL, sorting, column toggles, density, bulk stage/owner/follow-up actions, CSV export), Analytics (win rate, calibration, weekly trends, source performance), a lead drawer (scores, reasons, deal economics with win-probability override, draft reply, email threads, notes, activity timeline, delete), and Settings (credentials, ingest API keys, scan schedule, tier cutoffs, win-probability map, stage rename/reorder/semantics, team + invites, sources, notification thresholds) — plus login, signup, invite-accept, forgot/reset password and change-password flows wired to the auth endpoints.
+**The dashboard** implements the full Lead Desk design: a Today briefing (morning brief, KPIs, needs-attention queue, funnel/source/score charts), a drag-and-drop Pipeline board, the All Leads table (filters, presets, search-in-URL, sorting, column toggles, density, bulk stage/owner/follow-up actions, CSV export), Analytics (win rate, calibration, weekly trends, source performance), a lead drawer (scores, reasons, deal economics with win-probability override, draft reply, email threads, notes, activity timeline, delete), and Settings (inbox scanning — Gmail + Anthropic credentials, scan-now, schedule — optional webhook ingest keys, tier cutoffs, win-probability map, stage rename/reorder/semantics, team + invites, sources, notification thresholds) — plus login, signup, invite-accept, forgot/reset password and change-password flows wired to the auth endpoints.
 
 ---
 
@@ -43,8 +44,10 @@ Base path: `/api/v1`. All responses are JSON in camelCase. This section is a sum
 | | `POST /api/v1/auth/password/change` · `…/password/reset-request` · `…/password/reset` | reset-request always returns 200 (no user enumeration) |
 | Workspace | `GET /api/v1/workspace` · `GET /workspace/users` | settings + members |
 | | `PATCH /api/v1/workspace/settings` | OWNER/ADMIN; changing `tierThresholds`/`winProbabilityMap` recomputes all leads |
-| | `GET/PUT/DELETE /api/v1/workspace/credentials[/:kind]` | OWNER/ADMIN; kinds: `ANTHROPIC_API_KEY`, `GMAIL_OAUTH`, `N8N_WEBHOOK`, `GOOGLE_SHEET`; stored AES-256-GCM-encrypted, returned **masked only** |
+| | `GET/PUT/DELETE /api/v1/workspace/credentials[/:kind]` | OWNER/ADMIN; kinds: `ANTHROPIC_API_KEY`, `GMAIL_IMAP`, `N8N_WEBHOOK`; stored AES-256-GCM-encrypted, returned **masked only** |
 | | `GET/POST /api/v1/workspace/api-keys` · `DELETE /workspace/api-keys/:id` | OWNER/ADMIN; the full key is returned **exactly once** at creation |
+| Pipeline | `POST /api/v1/workspace/scan` | OWNER/ADMIN; kicks off an inbox scan in the background → `202 { started: true }` |
+| | `GET /api/v1/workspace/scan/status` | `{ configured, running, lastScanAt, pollMinutes, lastResult, lastError }` |
 | Leads | `GET /api/v1/leads` | filters/sort/search/pagination + `aggregates` (see below) |
 | | `GET /api/v1/leads/export.csv` | same filters, CSV download |
 | | `GET /api/v1/leads/:id` | full record incl. `threads`, `timeline`, `timeInStageHours` |
@@ -100,7 +103,7 @@ Fill them into `.env`. Every variable is documented inline in [.env.example](.en
 
 | Layer | What | How |
 |---|---|---|
-| 1. Application | Integration secrets (`Credential` rows: Anthropic key, Gmail OAuth, n8n webhook secret, Sheet id) | AES-256-GCM with `APP_ENCRYPTION_KEY`; API returns masked values only (`sk-…1234`) |
+| 1. Application | Integration secrets (`Credential` rows: Anthropic key, Gmail app password, webhook signing secret) | AES-256-GCM with `APP_ENCRYPTION_KEY`; API returns masked values only (`sk-…1234`) |
 | 2. Disk | Everything in Postgres (incl. lead PII) | **Full-disk encryption (LUKS) on the host partition** holding `/var/lib/docker/volumes` — an operator step, since Postgres has no free built-in TDE. Easiest at OS install time (choose encrypted LVM); retrofitting: `cryptsetup luksFormat` on a dedicated data partition, then move the Docker data root onto it. |
 | 3. Backups | Nightly dumps | `pg_dump \| gzip \| gpg --symmetric` (AES-256) with `BACKUP_ENCRYPTION_KEY` |
 
@@ -165,53 +168,21 @@ DATABASE_URL="postgresql://leadline:$POSTGRES_PASSWORD@127.0.0.1:5433/leadline" 
 
 The seed is idempotent (re-running updates instead of duplicating) and prints the demo login credentials when done.
 
-## Create the first workspace + ingest API key
+## Create the first workspace
 
 ```bash
 API=http://127.0.0.1:8080   # or your public URL later
 
-# 1. Signup — creates YOUR workspace and its OWNER account
+# Signup — creates YOUR workspace and its OWNER account
 curl -s $API/api/v1/auth/signup -H 'content-type: application/json' -d '{
   "workspaceName": "Fieldstone Training Group",
   "name": "Avery Fieldstone",
   "email": "you@yourdomain.com",
   "password": "a-long-unique-passphrase"
 }'
-
-# 2. Login → grab the accessToken from the response
-TOKEN=$(curl -s $API/api/v1/auth/login -H 'content-type: application/json' \
-  -d '{"email":"you@yourdomain.com","password":"a-long-unique-passphrase"}' | jq -r .accessToken)
-
-# 3. Create the ingest API key for n8n — the full key is shown ONLY ONCE
-curl -s $API/api/v1/workspace/api-keys -H "authorization: Bearer $TOKEN" \
-  -H 'content-type: application/json' -d '{"name":"n8n production"}'
-# → { "id": "…", "prefix": "llk_AbCd", "key": "llk_…FULL KEY…", "warning": "…" }
-
-# 4. Test the ingest webhook with that key
-curl -s $API/api/v1/ingest/leads -H 'x-api-key: llk_…' -H 'content-type: application/json' -d '{
-  "externalId": "thread_abc123",
-  "receivedAt": "2026-07-06T14:12:00Z",
-  "name": "Dana Okafor",
-  "email": "dana.okafor@northwindlogistics.com",
-  "org": "Northwind Logistics",
-  "source": "Email",
-  "inquiryType": "New project / hot lead",
-  "summary": "40-seat training request",
-  "fitScore": 9, "urgencyScore": 8, "leadScore": 9,
-  "dealValueLow": 6000, "dealValueHigh": 12000,
-  "estPayoutRaw": "$6,000–12,000 — 40-seat + exec, clear budget",
-  "estWork": "~20–30 hrs delivery",
-  "recommendedNextStep": "Offer a 20-min scoping call this week.",
-  "draftReply": "Hi Dana, …",
-  "fitReasons": ["Decision-maker (VP)","Budget allocated"],
-  "riskFlags": ["Exact dates unconfirmed"],
-  "inferredFields": ["dealValueLow","dealValueHigh"],
-  "threads": [{ "subject":"AI training for our team",
-    "url":"https://mail.google.com/mail/u/0/#all/abc123",
-    "direction":"in", "date":"2026-07-06T14:12:00Z", "snippet":"…" }]
-}'
-# → { "id": "…", "created": true }   — POST the same externalId again: { "created": false }, still one row
 ```
+
+(Or just open the dashboard and use the signup screen — same thing.) Then connect the inbox — see [Built-in inbox scanning](#built-in-inbox-scanning) below.
 
 ## Expose it
 
@@ -233,17 +204,40 @@ Requires a domain pointed at your IP (use DDNS if dynamic) and **only port 443/8
 
 Either way, the api and web containers are bound to `127.0.0.1` — the edge is the only public entry point, and all public traffic is TLS.
 
-## Point n8n at it
+## Built-in inbox scanning
 
-In the existing n8n workflow, replace the final **Append to Google Sheet** node with an **HTTP Request** node:
+The pipeline is part of this service — no external workflow tool. On the schedule set in Settings (default every 15 minutes), the API connects to the workspace's Gmail inbox over IMAP, reads mail newer than the last scan, scores each message with the Anthropic API (`claude-opus-4-8`, structured outputs), and upserts leads straight into Postgres. Genuine inquiries land in **New**; newsletters/receipts/spam are filed to the **Spam** stage so nothing silently disappears. Mail sent from the workspace's own address is skipped, at most 25 emails are scored per scan, and the first scan looks back 7 days.
 
-- **Method:** POST · **URL:** `https://api.yourdomain.com/api/v1/ingest/leads`
-- **Authentication:** Header Auth credential — name `x-api-key`, value = the ingest key from above.
-- **Body:** JSON, mapped from the "Finalize Row" fields to the camelCase payload shown in the curl above.
-- n8n retries and workflow re-runs are safe: the upsert by `externalId` never duplicates.
-- Keep the Sheets append as a parallel branch only if a per-client spreadsheet mirror is still wanted.
+**Connect it (Settings → Connection, as OWNER/ADMIN):**
 
-**Optional HMAC hardening:** set `INGEST_HMAC_ENABLED=true` in `.env`, store a shared secret via `PUT /api/v1/workspace/credentials/N8N_WEBHOOK` (`{"value":"<random secret>"}`), and have n8n send `x-signature` = hex HMAC-SHA256 of the raw JSON body with that secret. Once the secret exists, unsigned or mis-signed requests are rejected.
+1. **Gmail app password** — the Gmail account needs 2-Step Verification on. Then: Google Account → **Security** → **2-Step Verification** → **App passwords** → create one (name it "Leadline"), and paste the 16-character password plus the Gmail address into the **Gmail mailbox** card. Your real Google password is never used or stored.
+2. **Anthropic API key** — create one at [console.anthropic.com](https://console.anthropic.com) and paste it into the **Anthropic API key** card.
+3. Hit **Scan now** to test; pick a schedule. Both secrets are AES-256-GCM-encrypted at rest and only ever shown masked.
+
+Or via the API:
+
+```bash
+curl -s -X PUT $API/api/v1/workspace/credentials/GMAIL_IMAP -H "authorization: Bearer $TOKEN" \
+  -H 'content-type: application/json' \
+  -d '{"value":"<16-char app password>","meta":{"email":"inbox@yourdomain.com"}}'
+curl -s -X PUT $API/api/v1/workspace/credentials/ANTHROPIC_API_KEY -H "authorization: Bearer $TOKEN" \
+  -H 'content-type: application/json' -d '{"value":"sk-ant-…"}'
+curl -s -X POST $API/api/v1/workspace/scan -H "authorization: Bearer $TOKEN"    # → 202
+curl -s $API/api/v1/workspace/scan/status -H "authorization: Bearer $TOKEN"    # → progress + last result
+```
+
+Non-Gmail mailboxes work too: any IMAP server can be used by adding `"host"` and `"port"` to the `GMAIL_IMAP` credential's `meta`.
+
+Re-scans are idempotent — a lead is keyed by the email's Message-ID, so re-reading the same mail updates the AI fields but never duplicates, and the fields humans own (stage, owner, follow-up, notes, a win-probability override) always survive.
+
+## Optional: push leads from an external tool
+
+If something outside Leadline (a script, Zapier, a custom scraper) produces already-scored leads, it can deliver them to the ingest webhook instead of — or alongside — inbox scanning:
+
+- Create an ingest API key (Settings → Connection → External lead push, or `POST /api/v1/workspace/api-keys`); the full key is shown **only once**.
+- **POST** `https://api.yourdomain.com/api/v1/ingest/leads` with header `x-api-key: llk_…` and the camelCase payload documented in [docs/API.md §8](docs/API.md). Upsert is by `externalId` — retries never duplicate.
+
+**Optional HMAC hardening:** set `INGEST_HMAC_ENABLED=true` in `.env`, store a shared secret via `PUT /api/v1/workspace/credentials/N8N_WEBHOOK` (`{"value":"<random secret>"}`), and have the sender include `x-signature` = hex HMAC-SHA256 of the raw JSON body with that secret. Once the secret exists, unsigned or mis-signed requests are rejected.
 
 ## The dashboard
 
@@ -378,7 +372,7 @@ npm run dev         # http://localhost:5173 — proxies /api to 127.0.0.1:8080
 npm run build       # typecheck + production bundle
 ```
 
-Tests cover auth (signup/login/refresh rotation/reuse detection/invites/roles/password change+reset), workspace isolation, lead CRUD, every list filter, aggregates, sorting, pagination, CSV, analytics, safe-field enforcement, credential encryption/masking, and ingest (key auth, idempotent upsert, human-field preservation, HMAC).
+Tests cover auth (signup/login/refresh rotation/reuse detection/invites/roles/password change+reset), workspace isolation, lead CRUD, every list filter, aggregates, sorting, pagination, CSV, analytics, safe-field enforcement, credential encryption/masking, ingest (key auth, idempotent upsert, human-field preservation, HMAC), and the inbox-scanning pipeline (configuration gating, role checks, idempotent re-scans, spam routing, scan-cursor overlap, per-email error isolation — with the IMAP fetch and Claude scoring stubbed out).
 
 ## Design decisions & defaults
 

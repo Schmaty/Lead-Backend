@@ -3,15 +3,9 @@ import { fmtDate } from '../compute'
 import { useDesk } from '../store'
 import { btnSmall, C, card, inputS, linkDanger, mono, rolePill, serif, upLabel } from '../styles'
 import type { Role, WinBand } from '../types'
+import ConnectionTab from './SettingsConnection'
 
 const A = '#12433B'
-
-const CRED_ROWS: Array<[string, string, string]> = [
-  ['GOOGLE_SHEET', 'Google Sheet', 'The lead tracker sheet your pipeline reads and writes.'],
-  ['N8N_WEBHOOK', 'n8n webhook secret', 'Arms HMAC signature checks on every ingest call.'],
-  ['ANTHROPIC_API_KEY', 'Anthropic API key', 'Used by the pipeline to categorize, score, and draft replies.'],
-  ['GMAIL_OAUTH', 'Gmail OAuth', 'Lets the pipeline read and attach inbound email threads.'],
-]
 
 const sectionDesc: CSSProperties = { fontSize: 12, color: C.faint, marginBottom: 16, lineHeight: 1.5, maxWidth: '62ch' }
 const sectionTitle: CSSProperties = { fontWeight: 600, fontSize: 15, marginBottom: 3 }
@@ -54,8 +48,6 @@ export default function SettingsView(): ReactNode {
   const { st, set, canAdmin } = desk
   const settings = st.settings!
   const [stageDrafts, setStageDrafts] = useState<Record<number, string>>({})
-  const [credDrafts, setCredDrafts] = useState<Record<string, string>>({})
-  const [newKeyName, setNewKeyName] = useState('')
   const [newSource, setNewSource] = useState('')
   const [newType, setNewType] = useState('')
   const [invEmail, setInvEmail] = useState('')
@@ -75,10 +67,6 @@ export default function SettingsView(): ReactNode {
     ['notifications', 'Notifications'],
   ]
   const activeTab = tabs.some(([id]) => id === tab) ? tab : tabs[0]![0]
-
-  const activeKeys = st.apiKeys.filter((k) => !k.revokedAt)
-  const findCred = (kind: string) => st.credentials.find((c) => c.kind === kind)
-  const connected = !!findCred('GOOGLE_SHEET') && activeKeys.length > 0
 
   const gated: CSSProperties = canAdmin ? {} : { pointerEvents: 'none', opacity: 0.55 }
 
@@ -131,116 +119,7 @@ export default function SettingsView(): ReactNode {
         ))}
       </div>
 
-      {activeTab === 'connection' && canAdmin && (
-        <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
-          <div style={card}>
-            <div style={sectionTitle}>Integration credentials</div>
-            <div style={sectionDesc}>
-              Secrets the pipeline needs, encrypted at rest. They are write-only — once stored, only a masked value stays readable. Paste a new value to rotate one.
-            </div>
-            <div style={{ display: 'flex', alignItems: 'flex-start', gap: 11, background: C.bg3, borderRadius: 10, padding: '13px 15px', marginBottom: 18 }}>
-              <div style={{ width: 9, height: 9, borderRadius: 999, flex: '0 0 auto', marginTop: 5, background: connected ? C.ok : C.gold }} />
-              <div>
-                <div style={{ fontSize: 13, fontWeight: 600 }}>{connected ? 'Ingest armed' : 'Not receiving leads yet'}</div>
-                <div style={{ fontSize: 12, color: C.sub, marginTop: 2, lineHeight: 1.45 }}>
-                  {connected
-                    ? 'n8n authenticates with the API key below — "last used" confirms leads are flowing.'
-                    : 'Store the Google Sheet credential and create an ingest API key to start receiving scored leads.'}
-                </div>
-              </div>
-            </div>
-            <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
-              {CRED_ROWS.map(([kind, label, desc]) => {
-                const cred = findCred(kind)
-                return (
-                  <div key={kind} style={{ border: `1px solid ${C.line}`, borderRadius: 10, padding: '13px 15px' }}>
-                    <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 10, flexWrap: 'wrap' }}>
-                      <div style={{ minWidth: 0 }}>
-                        <div style={{ fontSize: 13, fontWeight: 600 }}>{label}</div>
-                        <div style={{ fontSize: 11.5, color: C.faint, marginTop: 1 }}>{desc}</div>
-                      </div>
-                      {cred && (
-                        <div style={{ display: 'flex', alignItems: 'center', gap: 10, flex: '0 0 auto' }}>
-                          <span style={{ fontFamily: mono, fontSize: 12, background: C.bg4, borderRadius: 6, padding: '4px 8px' }}>{cred.maskedValue}</span>
-                          <span style={{ fontSize: 11, color: C.faint }}>Rotated {fmtDate(cred.updatedAt)}</span>
-                          <button onClick={() => void desk.removeCredential(kind)} style={linkDanger}>Remove</button>
-                        </div>
-                      )}
-                    </div>
-                    <div style={{ display: 'flex', gap: 8, marginTop: 10 }}>
-                      <input
-                        value={credDrafts[kind] ?? ''}
-                        onChange={(e) => setCredDrafts((d) => ({ ...d, [kind]: e.target.value }))}
-                        placeholder="Paste value to set or rotate"
-                        style={{ flex: 1, padding: '8px 10px', border: `1px solid ${C.border2}`, borderRadius: 7, fontSize: 12.5, fontFamily: mono, background: C.bg2 }}
-                      />
-                      <button
-                        onClick={() => {
-                          const value = (credDrafts[kind] ?? '').trim()
-                          if (!value) { desk.toast('Paste a value first — secrets are write-only.'); return }
-                          void desk.saveCredential(kind, value)
-                          setCredDrafts((d) => ({ ...d, [kind]: '' }))
-                        }}
-                        style={btnSmall}
-                      >
-                        Save
-                      </button>
-                    </div>
-                  </div>
-                )
-              })}
-            </div>
-          </div>
-          <div style={card}>
-            <div style={sectionTitle}>Ingest API keys</div>
-            <div style={sectionDesc}>
-              Keys n8n uses to deliver scored leads to the ingest webhook. The full key is shown once at creation — after that only its prefix identifies it. Revoking is immediate.
-            </div>
-            {st.keyReveal && (
-              <div style={{ background: 'rgba(18,67,59,.06)', border: '1px solid rgba(18,67,59,.25)', borderRadius: 10, padding: '13px 15px', marginBottom: 14 }}>
-                <div style={{ fontSize: 12.5, fontWeight: 600, color: A }}>Copy this key now — it will not be shown again.</div>
-                <div style={{ fontFamily: mono, fontSize: 12.5, background: '#fff', border: `1px solid ${C.border2}`, borderRadius: 7, padding: '8px 10px', marginTop: 8, wordBreak: 'break-all' }}>
-                  {st.keyReveal.key}
-                </div>
-                <button onClick={() => set({ keyReveal: null })} style={{ background: 'none', border: 'none', color: A, cursor: 'pointer', fontSize: 12, fontWeight: 600, marginTop: 8, padding: 0 }}>
-                  I&apos;ve stored it
-                </button>
-              </div>
-            )}
-            <div style={{ display: 'flex', flexDirection: 'column', gap: 7, marginBottom: 12 }}>
-              {activeKeys.map((k) => (
-                <div key={k.id} style={{ display: 'flex', alignItems: 'center', gap: 12, background: C.bg3, borderRadius: 8, padding: '9px 12px', flexWrap: 'wrap' }}>
-                  <div style={{ width: 7, height: 7, borderRadius: 999, flex: '0 0 auto', background: k.lastUsedAt ? C.ok : C.gold }} />
-                  <span style={{ fontSize: 13, fontWeight: 600 }}>{k.name}</span>
-                  <span style={{ fontFamily: mono, fontSize: 12, color: C.sub }}>{k.prefix}…</span>
-                  <span style={{ fontSize: 11.5, color: C.faint }}>{k.lastUsedAt ? `Last used ${fmtDate(k.lastUsedAt)}` : 'Never used'}</span>
-                  <span style={{ fontSize: 11.5, color: C.faint, flex: 1 }}>Created {fmtDate(k.createdAt)}</span>
-                  <button onClick={() => void desk.revokeKey(k.id)} style={linkDanger}>Revoke</button>
-                </div>
-              ))}
-              {activeKeys.length === 0 && <div style={{ fontSize: 12.5, color: C.faint }}>No active keys yet.</div>}
-            </div>
-            <div style={{ display: 'flex', gap: 8, maxWidth: 420 }}>
-              <input value={newKeyName} onChange={(e) => setNewKeyName(e.target.value)} placeholder="Key name, e.g. n8n production" style={{ ...inputS, flex: 1 }} />
-              <button onClick={() => { void desk.createKey(newKeyName); setNewKeyName('') }} style={btnSmall}>Create key</button>
-            </div>
-          </div>
-          <div style={card}>
-            <div style={sectionTitle}>Scan schedule</div>
-            <div style={sectionDesc}>How often the pipeline polls the inbox for new inquiries.</div>
-            <div style={{ display: 'flex', border: `1px solid ${C.border2}`, borderRadius: 8, overflow: 'hidden', width: 'fit-content', flexWrap: 'wrap' }}>
-              {([[5, 'Every 5 min'], [15, 'Every 15 min'], [60, 'Hourly'], [240, 'Every 4 hours']] as const).map(([minutes, label]) => {
-                const active = settings.scanSettings.pollMinutes === minutes
-                return (
-                  <button key={minutes} onClick={() => void desk.saveSettings({ scanSettings: { pollMinutes: minutes } })} style={{ padding: '7px 13px', fontSize: 12.5, fontWeight: active ? 600 : 500, cursor: 'pointer', border: 'none', background: active ? 'rgba(18,67,59,.09)' : '#fff', color: active ? A : C.sub }}>
-                    {label}
-                  </button>
-                )
-              })}
-            </div>
-          </div>
-        </div>
-      )}
+      {activeTab === 'connection' && canAdmin && <ConnectionTab />}
 
       {activeTab === 'ai' && (
         <div style={{ display: 'flex', flexDirection: 'column', gap: 16, ...gated }}>

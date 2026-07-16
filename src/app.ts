@@ -10,6 +10,7 @@ import { registerErrorHandling } from './middleware/errorHandler.js'
 import analyticsRoutes from './modules/analytics/routes.js'
 import ingestRoutes from './modules/ingest/routes.js'
 import leadsRoutes from './modules/leads/routes.js'
+import pipelineRoutes from './modules/pipeline/routes.js'
 import workspaceRoutes from './modules/workspace/routes.js'
 import './types/augment.js'
 
@@ -79,6 +80,7 @@ export async function buildApp(config: AppConfig): Promise<FastifyInstance> {
 
   await app.register(authRoutes, { prefix: '/api/v1/auth' })
   await app.register(workspaceRoutes, { prefix: '/api/v1/workspace' })
+  await app.register(pipelineRoutes, { prefix: '/api/v1/workspace' })
   await app.register(leadsRoutes, { prefix: '/api/v1/leads' })
   await app.register(analyticsRoutes, { prefix: '/api/v1/analytics' })
   await app.register(ingestRoutes, { prefix: '/api/v1/ingest' })

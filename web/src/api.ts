@@ -4,6 +4,7 @@ import type {
   CredentialRow,
   Lead,
   Role,
+  ScanStatus,
   SessionUser,
   Settings,
   UserInfo,
@@ -136,9 +137,14 @@ export const api = {
       body: JSON.stringify(patch),
     }),
   credentials: () => request<{ credentials: CredentialRow[] }>('/workspace/credentials'),
-  putCredential: (kind: string, value: string) =>
-    request<CredentialRow>(`/workspace/credentials/${kind}`, { method: 'PUT', body: JSON.stringify({ value }) }),
+  putCredential: (kind: string, value: string, meta?: Record<string, unknown>) =>
+    request<CredentialRow>(`/workspace/credentials/${kind}`, {
+      method: 'PUT',
+      body: JSON.stringify(meta ? { value, meta } : { value }),
+    }),
   deleteCredential: (kind: string) => request<{ ok: boolean }>(`/workspace/credentials/${kind}`, { method: 'DELETE' }),
+  scan: () => request<{ started: boolean }>('/workspace/scan', { method: 'POST' }),
+  scanStatus: () => request<ScanStatus>('/workspace/scan/status'),
   apiKeys: () => request<{ apiKeys: ApiKeyRow[] }>('/workspace/api-keys'),
   createApiKey: (name: string) =>
     request<{ id: string; name: string; prefix: string; key: string }>('/workspace/api-keys', post({ name })),
