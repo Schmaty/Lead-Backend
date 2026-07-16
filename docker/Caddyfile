@@ -1,5 +1,7 @@
 # Automatic HTTPS for {$LEADLINE_DOMAIN} (Let's Encrypt).
+# The web service serves the dashboard AND proxies /api to the API, so one
+# hostname covers both.
 {$LEADLINE_DOMAIN} {
 	encode gzip
-	reverse_proxy api:8080
+	reverse_proxy web:80
 }

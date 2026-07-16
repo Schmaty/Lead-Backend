@@ -153,6 +153,11 @@ export default async function authRoutes(app: FastifyInstance): Promise<void> {
     if (!raw) throw new AppError(401, 'Missing refresh token')
     const result = await rotateRefreshToken(prisma, raw, config)
     if (!result.ok) {
+      // A benign multi-tab race: another tab just rotated this token and its
+      // replacement cookie is already in the jar — do NOT clear it.
+      if (result.reason === 'raced') {
+        throw new AppError(401, 'Refresh token was just rotated by a parallel request')
+      }
       clearRefreshCookie(reply)
       if (result.reason === 'reused') {
         await audit(prisma, {

@@ -282,6 +282,43 @@ describe('workspace settings recompute leads', () => {
     expect(sticky.json().winProbability).toBe(0.9)
   })
 
+  it('stageRenames update settings AND existing leads atomically', async () => {
+    const fresh = await signup(app, { email: 'owner@renames.test', workspaceName: 'Renames Co' })
+    const lead = await createLead(app, fresh, { name: 'Rename Rita', email: 'rr@r.test', stage: 'Contacted' })
+
+    const res = await api(app, fresh, {
+      method: 'PATCH',
+      url: '/api/v1/workspace/settings',
+      payload: { stageRenames: [{ from: 'Contacted', to: 'Reached out' }] },
+    })
+    expect(res.statusCode).toBe(200)
+    expect(res.json().renamedStages).toBe(1)
+    expect(res.json().settings.stages).toContain('Reached out')
+    expect(res.json().settings.stages).not.toContain('Contacted')
+
+    const after = await api(app, fresh, { method: 'GET', url: `/api/v1/leads/${lead.id}` })
+    expect(after.json().stage).toBe('Reached out')
+    // No stage_change timeline noise from the rename.
+    expect(after.json().timeline.filter((e: { type: string }) => e.type === 'stage_change')).toHaveLength(0)
+
+    // Renaming the won stage keeps semantics pointed at the new name.
+    const won = await api(app, fresh, {
+      method: 'PATCH',
+      url: '/api/v1/workspace/settings',
+      payload: { stageRenames: [{ from: 'Closed won', to: 'Won!' }] },
+    })
+    expect(won.json().settings.wonStage).toBe('Won!')
+    expect(won.json().settings.closedStages).toContain('Won!')
+
+    // Renaming to an existing stage name is rejected.
+    const dup = await api(app, fresh, {
+      method: 'PATCH',
+      url: '/api/v1/workspace/settings',
+      payload: { stageRenames: [{ from: 'New', to: 'Qualified' }] },
+    })
+    expect(dup.statusCode).toBe(400)
+  })
+
   it('rejects settings where wonStage is not one of stages', async () => {
     const res = await api(app, owner, {
       method: 'PATCH',

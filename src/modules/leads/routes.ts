@@ -79,7 +79,11 @@ export default async function leadsRoutes(app: FastifyInstance): Promise<void> {
         orderBy: sortOrder(query),
         skip: (query.page - 1) * query.pageSize,
         take: query.pageSize,
-        include: { owner: ownerSelect },
+        include: {
+          owner: ownerSelect,
+          ...(query.include.threads ? { threads: { orderBy: { date: 'asc' as const } } } : {}),
+          ...(query.include.timeline ? { timeline: { orderBy: { at: 'asc' as const } } } : {}),
+        },
       }),
       computeAggregates(prisma, where, settings),
     ])

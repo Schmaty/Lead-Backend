@@ -16,6 +16,7 @@ export function testEnv(overrides: Record<string, string> = {}): NodeJS.ProcessE
     JWT_ACCESS_SECRET: 'test-access-secret-test-access-secret-0001',
     JWT_REFRESH_SECRET: 'test-refresh-secret-test-refresh-secret-01',
     CORS_ORIGIN: 'http://localhost:5173',
+    REFRESH_REUSE_GRACE: '0s',
     RATE_LIMIT_MAX: '1000000',
     AUTH_RATE_LIMIT_MAX: '1000000',
     INGEST_RATE_LIMIT_MAX: '1000000',

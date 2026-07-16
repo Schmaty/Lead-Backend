@@ -1,6 +1,6 @@
 # Leadline API — complete reference
 
-Everything this backend can do, field by field, and exactly what the frontend must do to use it. Operational setup (Docker, secrets, backups) lives in the [README](../README.md).
+Everything this backend can do, field by field, and exactly what a frontend must do to use it. Operational setup (Docker, secrets, backups) lives in the [README](../README.md). A complete reference client — the Leadline Lead Desk dashboard — lives in [web/](../web/) and consumes exactly this API.
 
 - **Base URL:** `https://<your-api-host>` — all business endpoints live under `/api/v1`. Health probes live at the root.
 - **Wire format:** JSON, camelCase, UTF-8. All timestamps are ISO-8601 strings (`2026-07-06T14:12:00.000Z`). Send `content-type: application/json` on every request with a body — no other body content type is accepted.
@@ -47,7 +47,7 @@ async function apiFetch<T>(path: string, init: RequestInit = {}, retry = true): 
 }
 ```
 
-**Refresh rotation & theft detection:** every `/auth/refresh` invalidates the presented refresh token and issues a new one. If a token is presented twice (e.g. stolen and replayed), **all** sessions for that user are revoked and the API answers `401` with `"Refresh token reuse detected — all sessions revoked"`. The frontend should treat that like a forced logout.
+**Refresh rotation & theft detection:** every `/auth/refresh` invalidates the presented refresh token and issues a new one. If a rotated token is presented again *within* `REFRESH_REUSE_GRACE` (default 10 s) it is treated as a benign multi-tab race: that request gets a plain `401` (without clearing the cookie — the parallel tab's newer cookie stays valid). Presented *after* the grace window, it is treated as theft: **all** sessions for that user are revoked and the API answers `401` with `"Refresh token reuse detected — all sessions revoked"` — treat that as a forced logout. Frontends should still de-duplicate concurrent refresh calls (share one in-flight promise).
 
 **CORS:** the server allows only the origins in its `CORS_ORIGIN` env (with credentials). If the dashboard origin isn't listed there, every browser call fails preflight — that's configuration, not a frontend bug.
 
@@ -198,6 +198,7 @@ Every query parameter (all optional, all combinable — they AND together):
 | `replySent` | `true`/`false` | exact match |
 | `needsAttention` | `true` | hot OR overdue OR recent-unassigned (see §4) |
 | `search` | string ≤ 200 | case-insensitive substring across name, org, email, summary, notes |
+| `include` | `threads,timeline` | embed those relations in each list item (the dashboard uses this for client-side analytics) |
 | `sort` | enum | `receivedAt` (default) · `leadScore` · `fitScore` · `urgencyScore` · `expectedValue` · `winProbability` · `followUpDate` (nulls last) · `name` · `org` · `stage` · `lastTouchedAt` · `createdAt` |
 | `order` | `asc`/`desc` | default `desc` |
 | `page` | int ≥ 1 | default 1 |
@@ -323,8 +324,9 @@ Send any subset of:
 | `notificationThresholds` | `{ hotLeadScore: 0–10 }` | stored for the dashboard's use |
 | `scanSettings` | `{ pollMinutes: 1–1440 }` | stored for the pipeline's use |
 | `staleDays` | int 1–365 | stored for the dashboard's use |
+| `stageRenames` | `[{ from, to }, …]` | applied **before** the rest of the patch: renames the stage in `stages`/`closedStages`/`wonStage`/`lostStage` **and** on every lead carrying the old name, atomically, without timeline noise. `from` must exist; `to` must not collide. |
 
-→ `{ settings, recomputedLeads }` (`recomputedLeads` = how many leads changed). Unknown keys → 400. Audited.
+→ `{ settings, recomputedLeads, renamedStages }` (`recomputedLeads` = how many leads changed). Unknown keys → 400. Audited.
 
 ### Credentials (OWNER/ADMIN) — integration secrets, encrypted at rest
 Kinds: `ANTHROPIC_API_KEY` · `GMAIL_OAUTH` · `N8N_WEBHOOK` · `GOOGLE_SHEET`.
