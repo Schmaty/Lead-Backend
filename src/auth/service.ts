@@ -18,13 +18,15 @@ export async function issueRefreshToken(
 
 export type RotateResult =
   | { ok: true; user: User; raw: string }
-  | { ok: false; reason: 'unknown' | 'expired' }
+  | { ok: false; reason: 'unknown' | 'expired' | 'raced' }
   | { ok: false; reason: 'reused'; user: User }
 
 /**
  * Rotate a refresh token: revoke the presented one and issue a replacement.
- * Presenting an already-revoked token is treated as theft — every session for
- * that user is revoked.
+ * Presenting a token revoked longer than the grace window ago is treated as
+ * theft — every session for that user is revoked. Within the window it is a
+ * benign race (parallel tabs): the request just fails without the nuclear
+ * response, and the tab recovers via its still-valid access token or login.
  */
 export async function rotateRefreshToken(
   prisma: PrismaClient,
@@ -37,6 +39,9 @@ export async function rotateRefreshToken(
   })
   if (!stored) return { ok: false, reason: 'unknown' }
   if (stored.revokedAt) {
+    if (Date.now() - stored.revokedAt.getTime() <= config.refreshReuseGraceMs) {
+      return { ok: false, reason: 'raced' }
+    }
     await revokeAllForUser(prisma, stored.userId)
     return { ok: false, reason: 'reused', user: stored.user }
   }

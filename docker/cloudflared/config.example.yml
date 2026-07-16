@@ -3,7 +3,8 @@
 #
 # With the token approach (recommended, zero files):
 #   1. Cloudflare Zero Trust dashboard → Networks → Tunnels → Create a tunnel
-#   2. Public hostname: api.yourdomain.com → Service: http://api:8080
+#   2. Public hostname: leadline.yourdomain.com → Service: http://web:80
+#      (the web service serves the dashboard and proxies /api to the API)
 #   3. Copy the token into CLOUDFLARE_TUNNEL_TOKEN in .env
 #
 # With this file instead: mount it plus the tunnel credentials JSON into the
@@ -13,6 +14,6 @@ tunnel: <TUNNEL_UUID>
 credentials-file: /etc/cloudflared/<TUNNEL_UUID>.json
 
 ingress:
-  - hostname: api.yourdomain.com
-    service: http://api:8080
+  - hostname: leadline.yourdomain.com
+    service: http://web:80
   - service: http_status:404

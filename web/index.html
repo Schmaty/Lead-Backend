@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Leadline — Lead Desk</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Fraunces:ital,opsz,wght@0,9..144,400;0,9..144,500;0,9..144,600;1,9..144,400&family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap"
+      rel="stylesheet"
+    />
+    <style>
+      * { box-sizing: border-box; }
+      html, body { margin: 0; padding: 0; }
+      body {
+        font-family: 'Inter', system-ui, -apple-system, 'Segoe UI', sans-serif;
+        color: #1a1a1a;
+        background: #fafaf7;
+        -webkit-font-smoothing: antialiased;
+        text-rendering: optimizeLegibility;
+      }
+      a { color: #12433b; text-decoration: none; }
+      a:hover { color: #0d322c; }
+      input, select, textarea, button { font-family: inherit; color: inherit; }
+      input::placeholder, textarea::placeholder { color: #9a9a92; }
+      ::selection { background: rgba(18, 67, 59, 0.15); }
+      ::-webkit-scrollbar { width: 11px; height: 11px; }
+      ::-webkit-scrollbar-thumb { background: #e2e2db; border-radius: 999px; border: 3px solid #fafaf7; }
+      ::-webkit-scrollbar-thumb:hover { background: #d3d3ca; }
+      @keyframes ll-shimmer { 0% { background-position: -500px 0; } 100% { background-position: 500px 0; } }
+      @keyframes ll-scrim { from { opacity: 0; } to { opacity: 1; } }
+      @keyframes ll-panel { from { transform: translateX(24px); opacity: 0.4; } to { transform: translateX(0); opacity: 1; } }
+      @keyframes ll-toast { from { transform: translateY(10px); opacity: 0; } to { transform: translateY(0); opacity: 1; } }
+      @keyframes ll-fade { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: translateY(0); } }
+      @media (prefers-reduced-motion: reduce) { * { animation-duration: 0.001ms !important; transition-duration: 0.001ms !important; } }
+      @media (max-width: 840px) {
+        #ll-sidebar { width: 62px !important; flex-basis: 62px !important; }
+        #ll-sidebar [data-nav-label] { display: none !important; }
+        #ll-brandtext { display: none !important; }
+        #ll-nav .ll-navitem { justify-content: center; padding-left: 0 !important; padding-right: 0 !important; }
+        #ll-acct { justify-content: center; }
+      }
+      @media (max-width: 560px) {
+        #ll-topsearch { display: none !important; }
+        #ll-ws-label { display: none !important; }
+      }
+      .hv-bg:hover { background: #f7f7f2 !important; }
+      .hv-row:hover { background: #fafaf7 !important; }
+      .hv-dark:hover { background: #0d322c !important; }
+      .hv-ghost:hover { background: rgba(18, 67, 59, 0.06) !important; }
+      .hv-accent:hover { border-color: #12433b !important; color: #12433b !important; }
+      .hv-accentborder:hover { border-color: #12433b !important; }
+      .ll-navitem:hover { color: #12433b; }
+    </style>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

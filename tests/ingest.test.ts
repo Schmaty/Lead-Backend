@@ -185,6 +185,19 @@ describe('idempotent upsert by externalId', () => {
     expect((await ingest(basePayload({ receivedAt: 'yesterdayish' }))).statusCode).toBe(400)
   })
 
+  it('GET /leads?include=threads,timeline embeds relations in list items', async () => {
+    const plain = await api(app, owner, { method: 'GET', url: '/api/v1/leads' })
+    expect(plain.json().items[0].threads).toBeUndefined()
+    expect(plain.json().items[0].timeline).toBeUndefined()
+
+    const res = await api(app, owner, { method: 'GET', url: '/api/v1/leads?include=threads,timeline' })
+    expect(res.statusCode).toBe(200)
+    const item = res.json().items.find((l: { externalId: string }) => l.externalId === 'thread_abc123')
+    expect(Array.isArray(item.threads)).toBe(true)
+    expect(item.threads.length).toBeGreaterThan(0)
+    expect(item.timeline.some((e: { type: string }) => e.type === 'created')).toBe(true)
+  })
+
   it('tracks lastUsedAt on the key', async () => {
     const list = await api(app, owner, { method: 'GET', url: '/api/v1/workspace/api-keys' })
     const key = list.json().apiKeys.find((row: { id: string }) => row.id === apiKeyId)

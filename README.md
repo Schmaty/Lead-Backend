@@ -1,20 +1,22 @@
-# Leadline API
+# Leadline
 
-Self-hosted, multi-tenant backend for the Leadline lead-management product. It stores, secures and serves the leads that an n8n + Anthropic pipeline scores from Gmail, and exposes the REST API the Leadline dashboard consumes.
+Self-hosted, multi-tenant lead desk: the **Leadline API** (stores, secures and serves the leads an n8n + Anthropic pipeline scores from Gmail) plus the **Leadline dashboard** (the "Lead Desk" web app in [web/](web/)) that the team uses to read, triage and work those leads.
 
 ```
 ┌────────┐   ┌──────────────────────┐   ┌─────────────────────────┐   ┌────────────────────┐
 │ Gmail  │ → │ n8n + Anthropic      │ → │ Leadline API + Postgres │ → │ Leadline dashboard │
-│        │   │ (ingests & scores)   │   │ (stores, secures,       │   │ (team reads /      │
-│        │   │ POST /ingest/leads   │   │  serves — this repo)    │   │  triages / edits)  │
+│        │   │ (ingests & scores)   │   │ (stores, secures,       │   │ (web/ — served by  │
+│        │   │ POST /ingest/leads   │   │  serves)                │   │  the web service)  │
 └────────┘   └──────────────────────┘   └─────────────────────────┘   └────────────────────┘
 ```
 
 - **Multi-tenant:** every business row belongs to a `Workspace`; every query is workspace-scoped. One deployment can serve multiple client businesses with isolated data.
-- **Store-and-serve only:** no AI scoring happens here (that stays in n8n). No billing, no websockets — a clean, secure v1.
+- **Store-and-serve only:** no AI scoring happens here (that stays in n8n). No billing, no websockets — a clean, secure v1 (the dashboard polls).
 - **Portable by design:** Docker + config-only. Moving from the home server to a cloud VM later requires no code changes (see [Cloud migration](#cloud-migration-checklist)).
 
-**Stack:** Node.js 20 · TypeScript · Fastify 5 · Prisma 6 · PostgreSQL 16 · Docker Compose · Caddy or Cloudflare Tunnel at the edge.
+**Stack:** Node.js 20 · TypeScript · Fastify 5 · Prisma 6 · PostgreSQL 16 · React 19 + Vite (dashboard) · Docker Compose · Caddy or Cloudflare Tunnel at the edge.
+
+**The dashboard** implements the full Lead Desk design: a Today briefing (morning brief, KPIs, needs-attention queue, funnel/source/score charts), a drag-and-drop Pipeline board, the All Leads table (filters, presets, search-in-URL, sorting, column toggles, density, bulk stage/owner/follow-up actions, CSV export), Analytics (win rate, calibration, weekly trends, source performance), a lead drawer (scores, reasons, deal economics with win-probability override, draft reply, email threads, notes, activity timeline, delete), and Settings (credentials, ingest API keys, scan schedule, tier cutoffs, win-probability map, stage rename/reorder/semantics, team + invites, sources, notification thresholds) — plus login, signup, invite-accept, forgot/reset password and change-password flows wired to the auth endpoints.
 
 ---
 
@@ -127,7 +129,7 @@ await prisma.\$disconnect(); console.log('rotated')
 ## First run
 
 ```bash
-# api + db + nightly backups, API reachable on 127.0.0.1:8080 only:
+# api + db + dashboard + nightly backups (everything bound to localhost only):
 docker compose up -d --build
 
 # home hosting (recommended): adds the Cloudflare Tunnel
@@ -141,9 +143,12 @@ Database migrations run automatically when the `api` container starts (`prisma m
 
 ```bash
 docker compose ps
-curl -s http://127.0.0.1:8080/health   # {"status":"ok"}
+curl -s http://127.0.0.1:8080/health   # {"status":"ok"}   (API direct)
 curl -s http://127.0.0.1:8080/ready    # {"status":"ready"}
+open http://127.0.0.1:8081             # the dashboard (web service: SPA + /api proxy)
 ```
+
+The `web` service serves the built dashboard and proxies `/api` to the API — app and API share one origin, so cookies and CORS need no extra configuration.
 
 ### Optional: load the demo workspace
 
@@ -216,17 +221,17 @@ No port-forwarding, no static IP, no exposed inbound ports, free TLS + basic DDo
 
 1. Cloudflare dashboard → **Zero Trust → Networks → Tunnels → Create a tunnel** (Cloudflared connector).
 2. Copy the tunnel **token** into `CLOUDFLARE_TUNNEL_TOKEN` in `.env`.
-3. Add a **Public hostname**: `api.yourdomain.com` → service `http://api:8080`.
+3. Add a **Public hostname**: `leadline.yourdomain.com` → service `http://web:80` (dashboard + API on one hostname; add `api.yourdomain.com → http://api:8080` too only if something external needs the API without the dashboard).
 4. `docker compose --profile home up -d`
 
 ### Option B — Caddy + your own domain
 
 Requires a domain pointed at your IP (use DDNS if dynamic) and **only port 443/80 forwarded** to the server.
 
-1. Set `LEADLINE_DOMAIN=api.yourdomain.com` in `.env`.
-2. `docker compose --profile domain up -d` — Caddy provisions Let's Encrypt certificates automatically.
+1. Set `LEADLINE_DOMAIN=leadline.yourdomain.com` in `.env`.
+2. `docker compose --profile domain up -d` — Caddy provisions Let's Encrypt certificates automatically and proxies to the `web` service (dashboard + `/api`).
 
-Either way, the API container itself is bound to `127.0.0.1:8080` — the edge is the only public entry point, and all public traffic is TLS.
+Either way, the api and web containers are bound to `127.0.0.1` — the edge is the only public entry point, and all public traffic is TLS.
 
 ## Point n8n at it
 
@@ -240,12 +245,14 @@ In the existing n8n workflow, replace the final **Append to Google Sheet** node 
 
 **Optional HMAC hardening:** set `INGEST_HMAC_ENABLED=true` in `.env`, store a shared secret via `PUT /api/v1/workspace/credentials/N8N_WEBHOOK` (`{"value":"<random secret>"}`), and have n8n send `x-signature` = hex HMAC-SHA256 of the raw JSON body with that secret. Once the secret exists, unsigned or mis-signed requests are rejected.
 
-## Point the dashboard at it
+## The dashboard
 
-Set `CORS_ORIGIN` in `.env` to the dashboard's exact origin (e.g. `https://leadline.yourdomain.com`) — the allow-list is enforced with credentials. Then swap the dashboard's `dataService` seed adapter for HTTP:
+The dashboard ships in this repo (`web/`) and is served by the `web` compose service on the same origin as the API — no wiring needed. Sign in at your public hostname (or `http://127.0.0.1:8081` on the box) with the account you created above. Set `CORS_ORIGIN` in `.env` to that origin (it is also used for invite/reset links).
+
+Only if you host a **separate** dashboard on a different origin do you need CORS: set `CORS_ORIGIN` to that origin and use a fetch wrapper like this:
 
 ```ts
-// apiDataService.ts — drop-in replacement for the seed-data adapter
+// apiDataService.ts — pattern for an externally-hosted client
 const BASE = import.meta.env.VITE_API_URL ?? 'https://api.yourdomain.com'
 let accessToken: string | null = null
 
@@ -363,6 +370,12 @@ npm run build       # tsc → dist/
 npm run lint        # typecheck
 npx tsx scripts/dev-db.ts -- npx prisma migrate dev   # create a new migration
 npx tsx scripts/dev-db.ts -- npx tsx prisma/seed.ts   # seed the dev database
+
+# dashboard (in a second terminal, with dev:db + dev running):
+cd web
+npm ci
+npm run dev         # http://localhost:5173 — proxies /api to 127.0.0.1:8080
+npm run build       # typecheck + production bundle
 ```
 
 Tests cover auth (signup/login/refresh rotation/reuse detection/invites/roles/password change+reset), workspace isolation, lead CRUD, every list filter, aggregates, sorting, pagination, CSV, analytics, safe-field enforcement, credential encryption/masking, and ingest (key auth, idempotent upsert, human-field preservation, HMAC).

@@ -43,6 +43,14 @@ const settingsPatchSchema = z
     notificationThresholds: z.object({ hotLeadScore: z.number().int().min(0).max(10) }).optional(),
     scanSettings: z.object({ pollMinutes: z.number().int().min(1).max(1440) }).optional(),
     staleDays: z.number().int().min(1).max(365).optional(),
+    /**
+     * Rename existing stages. Applied before the rest of the patch: updates
+     * the stage lists AND every lead carrying the old name (no timeline noise).
+     */
+    stageRenames: z
+      .array(z.object({ from: z.string().trim().min(1).max(60), to: z.string().trim().min(1).max(60) }))
+      .max(30)
+      .optional(),
   })
   .strict()
 
@@ -91,12 +99,31 @@ export default async function workspaceRoutes(app: FastifyInstance): Promise<voi
   app.patch('/settings', { preHandler: [guard, adminOnly] }, async (request) => {
     const auth = request.auth!
     const wsId = workspaceId(request)
-    const patch = settingsPatchSchema.parse(request.body)
-    const provided = Object.fromEntries(Object.entries(patch).filter(([, value]) => value !== undefined))
-    if (Object.keys(provided).length === 0) throw new AppError(400, 'No settings provided')
+    const { stageRenames, ...rest } = settingsPatchSchema.parse(request.body)
+    const provided = Object.fromEntries(Object.entries(rest).filter(([, value]) => value !== undefined))
+    const renames = (stageRenames ?? []).filter((r) => r.from !== r.to)
+    if (Object.keys(provided).length === 0 && renames.length === 0) {
+      throw new AppError(400, 'No settings provided')
+    }
 
     const workspace = await prisma.workspace.findUniqueOrThrow({ where: { id: wsId } })
-    const merged: WorkspaceSettings = { ...resolveSettings(workspace.settings), ...provided }
+    let current = resolveSettings(workspace.settings)
+    for (const { from, to } of renames) {
+      if (!current.stages.includes(from)) {
+        throw new AppError(400, `Cannot rename unknown stage "${from}"`)
+      }
+      if (current.stages.includes(to)) {
+        throw new AppError(400, `Stage "${to}" already exists`)
+      }
+      current = {
+        ...current,
+        stages: current.stages.map((s) => (s === from ? to : s)),
+        closedStages: current.closedStages.map((s) => (s === from ? to : s)),
+        wonStage: current.wonStage === from ? to : current.wonStage,
+        lostStage: current.lostStage === from ? to : current.lostStage,
+      }
+    }
+    const merged: WorkspaceSettings = { ...current, ...provided }
 
     if (!merged.stages.includes(merged.wonStage)) {
       throw new AppError(400, `wonStage "${merged.wonStage}" must be one of stages`)
@@ -109,7 +136,12 @@ export default async function workspaceRoutes(app: FastifyInstance): Promise<voi
       throw new AppError(400, 'closedStages must be a subset of stages', { unknownStages: orphanClosed })
     }
 
-    await prisma.workspace.update({ where: { id: wsId }, data: { settings: merged as object } })
+    await prisma.$transaction([
+      ...renames.map(({ from, to }) =>
+        prisma.lead.updateMany({ where: { workspaceId: wsId, stage: from }, data: { stage: to } }),
+      ),
+      prisma.workspace.update({ where: { id: wsId }, data: { settings: merged as object } }),
+    ])
 
     // Thresholds or the probability map changed → recompute derived lead fields.
     let recomputedLeads = 0
@@ -120,10 +152,10 @@ export default async function workspaceRoutes(app: FastifyInstance): Promise<voi
       workspaceId: wsId,
       userId: auth.userId,
       action: 'workspace.settings_updated',
-      target: Object.keys(provided).join(','),
+      target: [...Object.keys(provided), ...(renames.length ? ['stageRenames'] : [])].join(','),
       ip: request.ip,
     })
-    return { settings: merged, recomputedLeads }
+    return { settings: merged, recomputedLeads, renamedStages: renames.length }
   })
 
   // ── Integration credentials (encrypted at rest, returned masked) ──────────

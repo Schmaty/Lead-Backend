@@ -65,6 +65,14 @@ export const listLeadsQuerySchema = z.object({
   replySent: boolString,
   needsAttention: boolString,
   search: z.string().trim().max(200).optional(),
+  /** Optional relation includes for list responses: "threads,timeline". */
+  include: z
+    .string()
+    .optional()
+    .transform((value) => {
+      const parts = (value ?? '').split(',').map((part) => part.trim())
+      return { threads: parts.includes('threads'), timeline: parts.includes('timeline') }
+    }),
   sort: z.enum(SORT_FIELDS).default('receivedAt'),
   order: z.enum(['asc', 'desc']).default('desc'),
   page: z.coerce.number().int().min(1).default(1),

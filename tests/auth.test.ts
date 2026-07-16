@@ -127,6 +127,30 @@ describe('login / refresh / logout', () => {
     expect(afterReuse.statusCode).toBe(401)
   })
 
+  it('reuse within the grace window is a benign race, not theft', async () => {
+    // Separate app instance with the production-like 10s grace window.
+    const graceApp = await makeApp({ REFRESH_REUSE_GRACE: '10s' })
+    try {
+      const login = await graceApp.inject({ method: 'POST', url: '/api/v1/auth/login', payload: { email, password } })
+      const cookie1 = extractRefreshCookie(login)
+      const refresh1 = await graceApp.inject({ method: 'POST', url: '/api/v1/auth/refresh', headers: { cookie: cookie1 } })
+      expect(refresh1.statusCode).toBe(200)
+      const cookie2 = extractRefreshCookie(refresh1)
+
+      // A parallel tab replays cookie1 immediately: rejected but NOT nuclear —
+      // and it must not clear the (shared) cookie jar's newer cookie.
+      const raced = await graceApp.inject({ method: 'POST', url: '/api/v1/auth/refresh', headers: { cookie: cookie1 } })
+      expect(raced.statusCode).toBe(401)
+      expect(raced.headers['set-cookie']).toBeUndefined()
+
+      // The winning tab's cookie still works.
+      const refresh2 = await graceApp.inject({ method: 'POST', url: '/api/v1/auth/refresh', headers: { cookie: cookie2 } })
+      expect(refresh2.statusCode).toBe(200)
+    } finally {
+      await graceApp.close()
+    }
+  })
+
   it('logout revokes the refresh token', async () => {
     const login = await app.inject({ method: 'POST', url: '/api/v1/auth/login', payload: { email, password } })
     const cookie = extractRefreshCookie(login)

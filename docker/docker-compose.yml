@@ -47,6 +47,18 @@ services:
       timeout: 5s
       retries: 12
 
+  # The Leadline dashboard: static SPA + /api proxy → one origin for app+API.
+  web:
+    build:
+      context: ..
+      dockerfile: docker/web/Dockerfile
+    restart: unless-stopped
+    depends_on:
+      - api
+    # Localhost only — the edge profile is the public entry point.
+    ports:
+      - "127.0.0.1:8081:80"
+
   # Public HTTPS via your own domain (requires ports 80/443 reachable).
   edge-caddy:
     profiles: ["domain"]
@@ -62,7 +74,7 @@ services:
       - caddy_data:/data
       - caddy_config:/config
     depends_on:
-      - api
+      - web
 
   # Public HTTPS via Cloudflare Tunnel — recommended for home hosting:
   # no port-forwarding, no exposed inbound ports.
@@ -72,7 +84,7 @@ services:
     restart: unless-stopped
     command: tunnel --no-autoupdate run --token ${CLOUDFLARE_TUNNEL_TOKEN:?set CLOUDFLARE_TUNNEL_TOKEN in .env}
     depends_on:
-      - api
+      - web
 
   # Nightly encrypted pg_dump into the backups volume.
   backup:

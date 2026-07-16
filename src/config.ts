@@ -13,6 +13,8 @@ export interface AppConfig {
   refreshTokenTtlSec: number
   inviteTokenTtlSec: number
   resetTokenTtlSec: number
+  /** Window in which reuse of a rotated refresh token is a benign tab race, not theft. */
+  refreshReuseGraceMs: number
   corsOrigins: string[]
   cookieDomain: string | undefined
   cookieSecure: boolean
@@ -55,6 +57,7 @@ const envSchema = z.object({
   REFRESH_TOKEN_TTL: z.string().default('30d'),
   INVITE_TOKEN_TTL: z.string().default('7d'),
   RESET_TOKEN_TTL: z.string().default('1h'),
+  REFRESH_REUSE_GRACE: z.string().default('10s'),
   CORS_ORIGIN: z.string().min(1, 'required — the dashboard origin, e.g. https://leadline.yourdomain.com'),
   COOKIE_DOMAIN: z.string().optional(),
   COOKIE_SECURE: boolString.optional(),
@@ -104,6 +107,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     REFRESH_TOKEN_TTL: raw.REFRESH_TOKEN_TTL,
     INVITE_TOKEN_TTL: raw.INVITE_TOKEN_TTL,
     RESET_TOKEN_TTL: raw.RESET_TOKEN_TTL,
+    REFRESH_REUSE_GRACE: raw.REFRESH_REUSE_GRACE,
     RATE_LIMIT_WINDOW: raw.RATE_LIMIT_WINDOW,
   })) {
     try {
@@ -133,6 +137,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     refreshTokenTtlSec: durations.REFRESH_TOKEN_TTL!,
     inviteTokenTtlSec: durations.INVITE_TOKEN_TTL!,
     resetTokenTtlSec: durations.RESET_TOKEN_TTL!,
+    refreshReuseGraceMs: durations.REFRESH_REUSE_GRACE! * 1000,
     corsOrigins,
     cookieDomain: raw.COOKIE_DOMAIN || undefined,
     cookieSecure: raw.COOKIE_SECURE ?? raw.NODE_ENV === 'production',
