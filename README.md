@@ -50,7 +50,7 @@ Base path: `/api/v1`. All responses are JSON in camelCase. This section is a sum
 | Pipeline | `POST /api/v1/workspace/gmail/connect` | OWNER/ADMIN; returns the Google consent URL — clients connect their inbox by signing in |
 | | `GET /api/v1/auth/google/callback` | public (Google redirects here); stores the workspace's `GMAIL_OAUTH` refresh token, bounces back to Settings |
 | | `POST /api/v1/workspace/scan` | OWNER/ADMIN; kicks off an inbox scan in the background → `202 { started: true }` |
-| | `GET /api/v1/workspace/scan/status` | `{ configured, method, email, googleSignInAvailable, aiReady, running, lastScanAt, pollMinutes, lastResult, lastError }` |
+| | `GET /api/v1/workspace/scan/status` | `{ configured, method, email, googleSignInAvailable, aiReady, running, progress, lastScanAt, pollMinutes, lastResult, lastError }` — `progress` reports live per-email counts while a scan runs |
 | Platform | `GET/PUT/DELETE /api/v1/platform/credentials[/:kind]` | **developer-only**; kinds: `ANTHROPIC_API_KEY` (universal AI key), `GOOGLE_OAUTH_CLIENT` (value = client secret, `meta.clientId`) |
 | Leads | `GET /api/v1/leads` | filters/sort/search/pagination + `aggregates` (see below) |
 | | `GET /api/v1/leads/export.csv` | same filters, CSV download |

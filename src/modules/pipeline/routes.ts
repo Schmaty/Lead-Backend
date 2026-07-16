@@ -70,6 +70,7 @@ export default async function pipelineRoutes(app: FastifyInstance): Promise<void
       googleSignInAvailable: info.googleSignInAvailable,
       aiReady: info.aiReady,
       running: state.running,
+      progress: state.running ? (state.progress ?? null) : null,
       lastScanAt: info.lastScanAt,
       pollMinutes: resolveSettings(workspace.settings).scanSettings.pollMinutes,
       lastResult: state.lastResult ?? null,

@@ -38,8 +38,20 @@ export interface ScanResult {
   errors: string[]
 }
 
+/** Live progress while a scan runs — what the dashboard banner renders. */
+export interface ScanProgress {
+  /** 'connecting' while the IMAP fetch runs; 'scoring' once emails are in hand. */
+  phase: 'connecting' | 'scoring'
+  total: number
+  processed: number
+  imported: number
+  updated: number
+  skipped: number
+}
+
 interface ScanState {
   running: boolean
+  progress?: ScanProgress
   lastResult?: ScanResult
   lastError?: string
 }
@@ -211,6 +223,8 @@ export async function runScan(
 
   state.running = true
   state.lastError = undefined
+  const progress: ScanProgress = { phase: 'connecting', total: 0, processed: 0, imported: 0, updated: 0, skipped: 0 }
+  state.progress = progress
   const startedAt = new Date()
   try {
     const workspace = await prisma.workspace.findUniqueOrThrow({ where: { id: workspaceId } })
@@ -231,12 +245,16 @@ export async function runScan(
     }
 
     const emails = await deps.fetchEmails(mailbox, since, MAX_EMAILS_PER_SCAN)
+    progress.phase = 'scoring'
+    progress.total = emails.length
 
     const result: ScanResult = { at: startedAt.toISOString(), scanned: emails.length, imported: 0, updated: 0, skipped: 0, errors: [] }
     for (const email of emails) {
       // Never score the workspace's own outbound mail that lands in INBOX.
       if (email.from.address === credentials.email.toLowerCase()) {
         result.skipped++
+        progress.processed++
+        progress.skipped++
         continue
       }
       try {
@@ -275,10 +293,17 @@ export async function runScan(
           initialStage: !scored.relevant && spamStage ? spamStage : 'New',
           createdDetail: `Scanned from inbox (${email.from.address})`,
         })
-        if (created) result.imported++
-        else result.updated++
+        if (created) {
+          result.imported++
+          progress.imported++
+        } else {
+          result.updated++
+          progress.updated++
+        }
       } catch (err) {
         result.errors.push(`"${email.subject}": ${err instanceof Error ? err.message : String(err)}`)
+      } finally {
+        progress.processed++
       }
     }
 
@@ -298,5 +323,6 @@ export async function runScan(
     throw err
   } finally {
     state.running = false
+    state.progress = undefined
   }
 }

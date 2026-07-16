@@ -379,9 +379,9 @@ Once a mailbox is connected (`GMAIL_OAUTH`, or the `GMAIL_IMAP` fallback) **and*
 | Call | Role | Returns |
 |---|---|---|
 | `POST /workspace/scan` | OWNER/ADMIN | `202 { started: true }` — the scan runs in the background. `400` if not configured, `409` if a scan is already running. Audited. |
-| `GET /workspace/scan/status` | any | `{ configured, method: "oauth"\|"imap"\|null, email, googleSignInAvailable, aiReady, running, lastScanAt, pollMinutes, lastResult, lastError }` where `lastResult` = `{ at, scanned, imported, updated, skipped, errors: string[] }` |
+| `GET /workspace/scan/status` | any | `{ configured, method: "oauth"\|"imap"\|null, email, googleSignInAvailable, aiReady, running, progress, lastScanAt, pollMinutes, lastResult, lastError }` where `progress` (non-null only while running) = `{ phase: "connecting"\|"scoring", total, processed, imported, updated, skipped }` and `lastResult` = `{ at, scanned, imported, updated, skipped, errors: string[] }` |
 
-Status drives the whole Settings UI: `email` null → show "Sign in with Google" (disabled with a call-your-developer note when `googleSignInAvailable` is false); `email` set → show the connected mailbox + Disconnect; `aiReady` false → the developer hasn't stored the platform key yet. Frontend flow for "Scan now": POST, poll status every ~2 s until `running` is false, then show `lastResult`/`lastError` and refresh the lead list.
+Status drives the whole Settings UI: `email` null → show "Sign in with Google" (disabled with a call-your-developer note when `googleSignInAvailable` is false); `email` set → show the connected mailbox + Disconnect; `aiReady` false → the developer hasn't stored the platform key yet. Frontend flow for "Scan now": POST, poll status every ~2 s rendering `progress` ("Scoring email 3 of 12…") until `running` is false, then show `lastResult`/`lastError` and refresh the lead list.
 
 ### API keys (developer-only) — for external tools → ingest auth (optional)
 

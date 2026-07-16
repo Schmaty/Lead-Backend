@@ -228,6 +228,15 @@ export interface ScanResult {
   errors: string[]
 }
 
+export interface ScanProgress {
+  phase: 'connecting' | 'scoring'
+  total: number
+  processed: number
+  imported: number
+  updated: number
+  skipped: number
+}
+
 export interface ScanStatus {
   configured: boolean
   method: 'oauth' | 'imap' | null
@@ -235,6 +244,7 @@ export interface ScanStatus {
   googleSignInAvailable: boolean
   aiReady: boolean
   running: boolean
+  progress: ScanProgress | null
   lastScanAt: string | null
   pollMinutes: number
   lastResult: ScanResult | null

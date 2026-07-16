@@ -231,6 +231,41 @@ describe('runScan', () => {
 })
 
 describe('scan route flow', () => {
+  it('reports live per-email progress while a scan runs', async () => {
+    const slowDeps: ScanDeps = {
+      fetchEmails: async () => [hotEmail, spamEmail],
+      scoreEmail: async (_key, email) => {
+        await new Promise((resolve) => setTimeout(resolve, 250))
+        return scoredFor[email.messageId]!
+      },
+    }
+    const restore = setScanDepsForTesting(slowDeps)
+    try {
+      const kick = await api(app, owner, { method: 'POST', url: '/api/v1/workspace/scan' })
+      expect(kick.statusCode).toBe(202)
+
+      let sawProgress = false
+      for (let i = 0; i < 100; i++) {
+        const res = await api(app, owner, { method: 'GET', url: '/api/v1/workspace/scan/status' })
+        const status = res.json()
+        if (status.running && status.progress?.phase === 'scoring') {
+          sawProgress = true
+          expect(status.progress.total).toBe(2)
+          expect(status.progress.processed).toBeLessThanOrEqual(2)
+        }
+        if (!status.running && status.lastResult) {
+          // Progress is only exposed while running.
+          expect(status.progress).toBeNull()
+          break
+        }
+        await new Promise((resolve) => setTimeout(resolve, 40))
+      }
+      expect(sawProgress).toBe(true)
+    } finally {
+      restore()
+    }
+  })
+
   it('POST /scan runs in the background and status reports the result', async () => {
     const restore = setScanDepsForTesting(fakeDeps([hotEmail, spamEmail]))
     try {

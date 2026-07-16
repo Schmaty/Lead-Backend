@@ -46,7 +46,11 @@ export default function ConnectionTab(): ReactNode {
 
   const loadStatus = async (): Promise<void> => {
     const status = await api.scanStatus().catch(() => null)
-    if (status) setScan(status)
+    if (status) {
+      setScan(status)
+      // A scheduled scan may already be in flight — attach and track it live.
+      if (status.running && !pollRef.current) startPolling()
+    }
   }
   const loadPlatform = async (): Promise<void> => {
     if (!isDev) return
@@ -155,21 +159,32 @@ export default function ConnectionTab(): ReactNode {
           Leadline reads your inbox on a schedule, scores each new inquiry with AI, and files it here — everything lives in Leadline&apos;s own database. AI scoring is included; there are no keys for you to manage.
         </div>
         <div style={{ display: 'flex', alignItems: 'flex-start', gap: 11, background: C.bg3, borderRadius: 10, padding: '13px 15px', marginBottom: 18 }}>
-          <div style={{ width: 9, height: 9, borderRadius: 999, flex: '0 0 auto', marginTop: 5, background: configured ? C.ok : C.gold }} />
-          <div>
+          <div style={{ width: 9, height: 9, borderRadius: 999, flex: '0 0 auto', marginTop: 5, background: scan?.running ? C.gold : configured ? C.ok : C.gold, animation: scan?.running ? 'll-pulse 1.2s ease infinite' : undefined }} />
+          <div style={{ flex: 1, minWidth: 0 }}>
             <div style={{ fontSize: 13, fontWeight: 600 }}>
               {scan?.running ? 'Scanning now…' : configured ? 'Inbox scanning armed' : 'Not scanning yet'}
             </div>
             <div style={{ fontSize: 12, color: C.sub, marginTop: 2, lineHeight: 1.45 }}>
-              {configured
-                ? scan?.lastScanAt
-                  ? `Last scan ${fmtDate(scan.lastScanAt)}${lastResult ? ` — ${lastResult.imported} new, ${lastResult.updated} updated, ${lastResult.skipped} skipped${lastResult.errors.length ? `, ${lastResult.errors.length} errors` : ''}` : ''}`
-                  : 'Ready — the first scan reads the last 7 days of mail.'
-                : mailboxConnected && !scan?.aiReady
-                  ? 'Mailbox connected. AI scoring isn’t enabled yet — your developer needs to finish platform setup.'
-                  : 'Connect your Gmail inbox below to start.'}
+              {scan?.running
+                ? scan.progress && scan.progress.phase === 'scoring'
+                  ? scan.progress.total === 0
+                    ? 'Inbox read — no new mail in this window.'
+                    : `Scoring email ${Math.min(scan.progress.processed + 1, scan.progress.total)} of ${scan.progress.total} — ${scan.progress.imported} new, ${scan.progress.updated} updated${scan.progress.skipped ? `, ${scan.progress.skipped} skipped` : ''} so far`
+                  : 'Connecting to the inbox and reading new mail…'
+                : configured
+                  ? scan?.lastScanAt
+                    ? `Last scan ${fmtDate(scan.lastScanAt)}${lastResult ? ` — ${lastResult.imported} new, ${lastResult.updated} updated, ${lastResult.skipped} skipped${lastResult.errors.length ? `, ${lastResult.errors.length} errors` : ''}` : ''}`
+                    : 'Ready — the first scan reads the last 7 days of mail.'
+                  : mailboxConnected && !scan?.aiReady
+                    ? 'Mailbox connected. AI scoring isn’t enabled yet — your developer needs to finish platform setup.'
+                    : 'Connect your Gmail inbox below to start.'}
             </div>
-            {scan?.lastError && <div style={{ fontSize: 12, color: C.danger, marginTop: 4 }}>Last scan failed: {scan.lastError}</div>}
+            {scan?.running && scan.progress && scan.progress.phase === 'scoring' && scan.progress.total > 0 && (
+              <div style={{ height: 4, background: C.bg4, borderRadius: 999, marginTop: 8, overflow: 'hidden' }}>
+                <div style={{ height: '100%', width: `${Math.round((scan.progress.processed / scan.progress.total) * 100)}%`, background: A, borderRadius: 999, transition: 'width .4s ease' }} />
+              </div>
+            )}
+            {!scan?.running && scan?.lastError && <div style={{ fontSize: 12, color: C.danger, marginTop: 4 }}>Last scan failed: {scan.lastError}</div>}
           </div>
         </div>
 
