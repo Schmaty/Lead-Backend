@@ -138,7 +138,9 @@ export default function Shell(): ReactNode {
             </div>
             <div data-nav-label style={{ minWidth: 0, flex: 1 }}>
               <div style={{ fontSize: 12.5, fontWeight: 600, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{user.name}</div>
-              <div style={{ fontSize: 11, color: C.sub }}>{user.role === 'OWNER' ? 'Owner · admin' : user.role === 'ADMIN' ? 'Admin' : 'Member'}</div>
+              <div style={{ fontSize: 11, color: C.sub }}>
+                {user.developer ? 'Developer' : user.role === 'OWNER' ? 'Owner · admin' : user.role === 'ADMIN' ? 'Admin' : 'Member'}
+              </div>
             </div>
             <span data-nav-label style={{ color: C.faint, display: 'flex' }}>
               <IChevronUp size={15} strokeWidth={1.8} />

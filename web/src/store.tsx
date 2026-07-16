@@ -368,9 +368,17 @@ export function DeskProvider({ children }: { children: ReactNode }): ReactNode {
 
   const loadAdminData = async (): Promise<void> => {
     if (stRef.current.user?.role === 'MEMBER') return
+    // API keys are developer-only — a plain OWNER/ADMIN gets 403 there but
+    // must still see credential status, so the two loads are independent.
     try {
-      const [creds, keys] = await Promise.all([api.credentials(), api.apiKeys()])
-      set({ credentials: creds.credentials, apiKeys: keys.apiKeys, adminDataLoaded: true })
+      const creds = await api.credentials()
+      set({ credentials: creds.credentials, adminDataLoaded: true })
+    } catch (e) {
+      if (!(e instanceof ApiError && e.status === 403)) toast(errMsg(e))
+    }
+    try {
+      const keys = await api.apiKeys()
+      set({ apiKeys: keys.apiKeys })
     } catch (e) {
       if (!(e instanceof ApiError && e.status === 403)) toast(errMsg(e))
     }

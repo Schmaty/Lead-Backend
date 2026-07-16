@@ -1,8 +1,9 @@
 import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify'
 import type { User } from '@prisma/client'
 import { z } from 'zod'
+import type { AppConfig } from '../config.js'
 import { hashPassword, sha256Hex, verifyPassword } from '../crypto/hashing.js'
-import { authGuard, requireRole } from '../middleware/authGuard.js'
+import { authGuard, isDeveloper, requireRole } from '../middleware/authGuard.js'
 import { AppError } from '../middleware/errorHandler.js'
 import { audit } from '../services/audit.js'
 import { sendMail } from '../services/mailer.js'
@@ -52,12 +53,13 @@ const resetRequestSchema = z.object({ email: emailSchema }).strict()
 
 const resetSchema = z.object({ token: z.string().min(1), newPassword: z.string() }).strict()
 
-function publicUser(user: User) {
+function publicUser(user: User, config: AppConfig) {
   return {
     id: user.id,
     name: user.name,
     email: user.email,
     role: user.role,
+    developer: isDeveloper(config, user.email),
     lastLoginAt: user.lastLoginAt,
     createdAt: user.createdAt,
   }
@@ -122,7 +124,7 @@ export default async function authRoutes(app: FastifyInstance): Promise<void> {
     await audit(prisma, { workspaceId: workspace.id, userId: user.id, action: 'auth.signup', target: user.email, ip: request.ip })
     return reply.status(201).send({
       accessToken,
-      user: publicUser(user),
+      user: publicUser(user, config),
       workspace: { id: workspace.id, name: workspace.name, slug: workspace.slug, settings: workspace.settings },
     })
   })
@@ -144,7 +146,7 @@ export default async function authRoutes(app: FastifyInstance): Promise<void> {
     await prisma.user.update({ where: { id: user.id }, data: { lastLoginAt: new Date() } })
     const accessToken = await issueSession(reply, user)
     await audit(prisma, { workspaceId: user.workspaceId, userId: user.id, action: 'auth.login', target: user.email, ip: request.ip })
-    return { accessToken, user: publicUser(user) }
+    return { accessToken, user: publicUser(user, config) }
   })
 
   // ── Refresh: rotate the refresh token, detect reuse ────────────────────────
@@ -172,7 +174,7 @@ export default async function authRoutes(app: FastifyInstance): Promise<void> {
       throw new AppError(401, 'Invalid or expired refresh token')
     }
     setRefreshCookie(reply, result.raw)
-    return { accessToken: signAccessToken(result.user, config), user: publicUser(result.user) }
+    return { accessToken: signAccessToken(result.user, config), user: publicUser(result.user, config) }
   })
 
   // ── Logout ─────────────────────────────────────────────────────────────────
@@ -195,7 +197,7 @@ export default async function authRoutes(app: FastifyInstance): Promise<void> {
     const user = await prisma.user.findUnique({ where: { id: auth.userId } })
     if (!workspace || !user) throw new AppError(401, 'Invalid access token')
     return {
-      user: publicUser(user),
+      user: publicUser(user, config),
       workspace: { id: workspace.id, name: workspace.name, slug: workspace.slug, settings: workspace.settings },
     }
   })
@@ -248,7 +250,7 @@ export default async function authRoutes(app: FastifyInstance): Promise<void> {
     await audit(prisma, { workspaceId: workspace.id, userId: user.id, action: 'auth.invite_accepted', target: user.email, ip: request.ip })
     return reply.status(201).send({
       accessToken,
-      user: publicUser(user),
+      user: publicUser(user, config),
       workspace: { id: workspace.id, name: workspace.name, slug: workspace.slug, settings: workspace.settings },
     })
   })

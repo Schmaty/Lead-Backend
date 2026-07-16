@@ -90,7 +90,9 @@ let owner: Session
 let member: Session
 
 beforeAll(async () => {
-  app = await makeApp()
+  // The owner doubles as the platform developer: GMAIL_IMAP (fallback path)
+  // and the universal Anthropic key are developer-managed.
+  app = await makeApp({ DEVELOPER_EMAILS: 'owner@pipeline.test' })
   await resetDb(app)
   owner = await signup(app, { email: 'owner@pipeline.test', workspaceName: 'Pipeline Co' })
   member = await addMember(app, owner, 'member@pipeline.test')
@@ -116,32 +118,40 @@ describe('scan configuration and permissions', () => {
     expect(res.statusCode).toBe(403)
   })
 
-  it('accepts the GMAIL_IMAP credential with mailbox metadata', async () => {
+  it('arms via the GMAIL_IMAP fallback plus the platform Anthropic key', async () => {
     const gmail = await api(app, owner, {
       method: 'PUT',
       url: '/api/v1/workspace/credentials/GMAIL_IMAP',
       payload: { value: 'gmail-app-password-0001', meta: { email: MAILBOX_ADDRESS } },
     })
     expect(gmail.statusCode).toBe(200)
+
+    // AI key is universal — one platform credential covers every workspace.
     const anthropic = await api(app, owner, {
       method: 'PUT',
-      url: '/api/v1/workspace/credentials/ANTHROPIC_API_KEY',
+      url: '/api/v1/platform/credentials/ANTHROPIC_API_KEY',
       payload: { value: 'sk-ant-test-not-real-0001' },
     })
     expect(anthropic.statusCode).toBe(200)
 
     const status = await api(app, owner, { method: 'GET', url: '/api/v1/workspace/scan/status' })
     expect(status.json().configured).toBe(true)
+    expect(status.json().method).toBe('imap')
+    expect(status.json().email).toBe(MAILBOX_ADDRESS)
+    expect(status.json().aiReady).toBe(true)
+    expect(status.json().googleSignInAvailable).toBe(false)
     expect(status.json().lastScanAt).toBeNull()
   })
 
-  it('the retired GOOGLE_SHEET kind is no longer accepted', async () => {
-    const res = await api(app, owner, {
-      method: 'PUT',
-      url: '/api/v1/workspace/credentials/GOOGLE_SHEET',
-      payload: { value: 'sheet-id' },
-    })
-    expect(res.statusCode).toBe(400)
+  it('retired workspace credential kinds are no longer accepted', async () => {
+    for (const kind of ['GOOGLE_SHEET', 'ANTHROPIC_API_KEY']) {
+      const res = await api(app, owner, {
+        method: 'PUT',
+        url: `/api/v1/workspace/credentials/${kind}`,
+        payload: { value: 'whatever' },
+      })
+      expect(res.statusCode).toBe(400)
+    }
   })
 })
 

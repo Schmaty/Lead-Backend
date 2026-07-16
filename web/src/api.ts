@@ -145,6 +145,18 @@ export const api = {
   deleteCredential: (kind: string) => request<{ ok: boolean }>(`/workspace/credentials/${kind}`, { method: 'DELETE' }),
   scan: () => request<{ started: boolean }>('/workspace/scan', { method: 'POST' }),
   scanStatus: () => request<ScanStatus>('/workspace/scan/status'),
+  /** Start the Google sign-in that connects this workspace's inbox. */
+  gmailConnect: () => request<{ url: string }>('/workspace/gmail/connect', { method: 'POST' }),
+
+  // ── platform (developer account only) ───────────────────────────────────
+  platformCredentials: () => request<{ credentials: CredentialRow[] }>('/platform/credentials'),
+  putPlatformCredential: (kind: string, value: string, meta?: Record<string, unknown>) =>
+    request<CredentialRow>(`/platform/credentials/${kind}`, {
+      method: 'PUT',
+      body: JSON.stringify(meta ? { value, meta } : { value }),
+    }),
+  deletePlatformCredential: (kind: string) =>
+    request<{ ok: boolean }>(`/platform/credentials/${kind}`, { method: 'DELETE' }),
   apiKeys: () => request<{ apiKeys: ApiKeyRow[] }>('/workspace/api-keys'),
   createApiKey: (name: string) =>
     request<{ id: string; name: string; prefix: string; key: string }>('/workspace/api-keys', post({ name })),

@@ -7,7 +7,8 @@ let owner: Session
 let member: Session
 
 beforeAll(async () => {
-  app = await makeApp()
+  // The owner doubles as the developer so the credential round-trip test can PUT.
+  app = await makeApp({ DEVELOPER_EMAILS: 'owner@leads.test' })
   await resetDb(app)
   owner = await signup(app, { email: 'owner@leads.test', workspaceName: 'Leads Co' })
   member = await addMember(app, owner, 'member@leads.test')
@@ -334,7 +335,7 @@ describe('credentials are encrypted and masked', () => {
     const secret = 'sk-ant-api-key-super-secret-0042'
     const put = await api(app, owner, {
       method: 'PUT',
-      url: '/api/v1/workspace/credentials/ANTHROPIC_API_KEY',
+      url: '/api/v1/workspace/credentials/N8N_WEBHOOK',
       payload: { value: secret },
     })
     expect(put.statusCode).toBe(200)
@@ -347,18 +348,18 @@ describe('credentials are encrypted and masked', () => {
 
     // At rest: ciphertext, not plaintext.
     const row = await app.prisma.credential.findFirstOrThrow({
-      where: { workspaceId: owner.workspace.id, kind: 'ANTHROPIC_API_KEY' },
+      where: { workspaceId: owner.workspace.id, kind: 'N8N_WEBHOOK' },
     })
     expect(row.encryptedValue).not.toContain(secret)
     expect(row.encryptedValue.split(':')).toHaveLength(3)
 
     const del = await api(app, owner, {
       method: 'DELETE',
-      url: '/api/v1/workspace/credentials/ANTHROPIC_API_KEY',
+      url: '/api/v1/workspace/credentials/N8N_WEBHOOK',
     })
     expect(del.statusCode).toBe(200)
     expect(
-      (await api(app, owner, { method: 'DELETE', url: '/api/v1/workspace/credentials/ANTHROPIC_API_KEY' }))
+      (await api(app, owner, { method: 'DELETE', url: '/api/v1/workspace/credentials/N8N_WEBHOOK' }))
         .statusCode,
     ).toBe(404)
   })

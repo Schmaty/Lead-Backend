@@ -1,6 +1,6 @@
 import type { FastifyInstance } from 'fastify'
 import { resolveSettings } from '../../types/settings.js'
-import { getScanState, GMAIL_CREDENTIAL_KIND, loadScanCredentials, runScan } from './scanner.js'
+import { getScanState, GMAIL_IMAP_KIND, GMAIL_OAUTH_KIND, resolveScanSetup, runScan } from './scanner.js'
 
 const TICK_MS = 60_000
 
@@ -10,14 +10,15 @@ const TICK_MS = 60_000
  */
 export function startScanScheduler(app: FastifyInstance): () => void {
   const tick = async (): Promise<void> => {
-    const gmailCredentials = await app.prisma.credential.findMany({
-      where: { kind: GMAIL_CREDENTIAL_KIND },
+    const mailboxCredentials = await app.prisma.credential.findMany({
+      where: { kind: { in: [GMAIL_OAUTH_KIND, GMAIL_IMAP_KIND] } },
       select: { workspaceId: true },
     })
-    for (const { workspaceId } of gmailCredentials) {
+    const workspaceIds = [...new Set(mailboxCredentials.map((c) => c.workspaceId))]
+    for (const workspaceId of workspaceIds) {
       try {
         if (getScanState(workspaceId).running) continue
-        const credentials = await loadScanCredentials(app.prisma, app.config, workspaceId)
+        const { credentials } = await resolveScanSetup(app.prisma, app.config, workspaceId)
         if (!credentials) continue
         const workspace = await app.prisma.workspace.findUnique({ where: { id: workspaceId } })
         if (!workspace) continue

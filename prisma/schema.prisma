@@ -168,3 +168,14 @@ model AuditLog {
 
   @@index([workspaceId, at])
 }
+
+/// Platform-wide secrets managed only by the developer account
+/// (Anthropic API key, Google OAuth client). Not workspace-scoped.
+model PlatformCredential {
+  id             String   @id @default(cuid())
+  kind           String   @unique
+  encryptedValue String
+  meta           Json     @default("{}")
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+}

@@ -3,12 +3,22 @@ import type { AppConfig } from '../../config.js'
 import { decryptSecret } from '../../crypto/secrets.js'
 import { AppError } from '../../middleware/errorHandler.js'
 import { upsertLeadByExternalId } from '../../services/leadUpsert.js'
+import {
+  getGoogleOauthClient,
+  getPlatformAnthropicKey,
+  type GoogleOauthClient,
+} from '../../services/platformCredentials.js'
 import { resolveSettings, type WorkspaceSettings } from '../../types/settings.js'
+import { googleOauth } from './googleOauth.js'
 import { fetchRecentEmails, type InboundEmail, type MailboxConfig } from './mailbox.js'
 import { createAnthropic, scoreEmail, type ScoredLead } from './scorer.js'
 
-export const GMAIL_CREDENTIAL_KIND = 'GMAIL_IMAP'
-export const ANTHROPIC_CREDENTIAL_KIND = 'ANTHROPIC_API_KEY'
+/** Client sign-in path: value = Google refresh token, meta = { email, lastScanAt }. */
+export const GMAIL_OAUTH_KIND = 'GMAIL_OAUTH'
+/** Fallback path (developer-managed): value = app password, meta = { email, host?, port?, lastScanAt }. */
+export const GMAIL_IMAP_KIND = 'GMAIL_IMAP'
+/** Pre-platform installs stored the Anthropic key per workspace; still honored as a fallback. */
+const LEGACY_ANTHROPIC_KIND = 'ANTHROPIC_API_KEY'
 
 const DEFAULT_IMAP_HOST = 'imap.gmail.com'
 const DEFAULT_IMAP_PORT = 993
@@ -70,40 +80,110 @@ export function setScanDepsForTesting(deps: ScanDeps): () => void {
   }
 }
 
-interface ScanCredentials {
-  mailbox: MailboxConfig
-  anthropicApiKey: string
-  gmailCredentialId: string
+/** What the status endpoint (and the dashboard) needs to render the connect flow. */
+export interface ScanConfigInfo {
+  configured: boolean
+  method: 'oauth' | 'imap' | null
+  email: string | null
+  /** True when the developer has stored the platform Google OAuth client. */
+  googleSignInAvailable: boolean
+  /** True when a platform (or legacy workspace) Anthropic key exists. */
+  aiReady: boolean
   lastScanAt: Date | null
 }
 
-/** Load and decrypt the scanner credentials, or null when not configured. */
-export async function loadScanCredentials(
+interface ScanCredentials {
+  method: 'oauth' | 'imap'
+  email: string
+  host: string
+  port: number
+  anthropicApiKey: string
+  /** The workspace credential row that carries the lastScanAt cursor in meta. */
+  credentialId: string
+  lastScanAt: Date | null
+  /** oauth method */
+  refreshToken?: string
+  googleClient?: GoogleOauthClient
+  /** imap method */
+  pass?: string
+}
+
+interface CredentialMeta {
+  email?: string
+  host?: string
+  port?: number
+  lastScanAt?: string
+}
+
+/**
+ * Resolve how (and whether) this workspace can scan. Mailbox: the OAuth
+ * sign-in connection wins; the developer-managed app-password credential is
+ * the fallback. AI: the platform key (universal, developer-managed) wins; a
+ * legacy per-workspace key still works.
+ */
+export async function resolveScanSetup(
   prisma: PrismaClient,
   config: AppConfig,
   workspaceId: string,
-): Promise<ScanCredentials | null> {
-  const [gmail, anthropic] = await Promise.all([
-    prisma.credential.findUnique({
-      where: { workspaceId_kind: { workspaceId, kind: GMAIL_CREDENTIAL_KIND } },
-    }),
-    prisma.credential.findUnique({
-      where: { workspaceId_kind: { workspaceId, kind: ANTHROPIC_CREDENTIAL_KIND } },
-    }),
+): Promise<{ info: ScanConfigInfo; credentials: ScanCredentials | null }> {
+  const [oauthCred, imapCred, legacyAnthropic, platformKey, googleClient] = await Promise.all([
+    prisma.credential.findUnique({ where: { workspaceId_kind: { workspaceId, kind: GMAIL_OAUTH_KIND } } }),
+    prisma.credential.findUnique({ where: { workspaceId_kind: { workspaceId, kind: GMAIL_IMAP_KIND } } }),
+    prisma.credential.findUnique({ where: { workspaceId_kind: { workspaceId, kind: LEGACY_ANTHROPIC_KIND } } }),
+    getPlatformAnthropicKey(prisma, config),
+    getGoogleOauthClient(prisma, config),
   ])
-  if (!gmail || !anthropic) return null
-  const meta = (gmail.meta ?? {}) as { email?: string; host?: string; port?: number; lastScanAt?: string }
-  if (!meta.email) return null
+
+  let anthropicApiKey = platformKey
+  if (!anthropicApiKey && legacyAnthropic) {
+    try {
+      anthropicApiKey = decryptSecret(legacyAnthropic.encryptedValue, config.encryptionKey)
+    } catch {
+      anthropicApiKey = null
+    }
+  }
+
+  const oauthMeta = (oauthCred?.meta ?? {}) as CredentialMeta
+  const imapMeta = (imapCred?.meta ?? {}) as CredentialMeta
+
+  let credentials: ScanCredentials | null = null
+  if (oauthCred && oauthMeta.email && googleClient && anthropicApiKey) {
+    credentials = {
+      method: 'oauth',
+      email: oauthMeta.email,
+      host: DEFAULT_IMAP_HOST,
+      port: DEFAULT_IMAP_PORT,
+      anthropicApiKey,
+      credentialId: oauthCred.id,
+      lastScanAt: oauthMeta.lastScanAt ? new Date(oauthMeta.lastScanAt) : null,
+      refreshToken: decryptSecret(oauthCred.encryptedValue, config.encryptionKey),
+      googleClient,
+    }
+  } else if (imapCred && imapMeta.email && anthropicApiKey) {
+    credentials = {
+      method: 'imap',
+      email: imapMeta.email,
+      host: imapMeta.host || DEFAULT_IMAP_HOST,
+      port: imapMeta.port || DEFAULT_IMAP_PORT,
+      anthropicApiKey,
+      credentialId: imapCred.id,
+      lastScanAt: imapMeta.lastScanAt ? new Date(imapMeta.lastScanAt) : null,
+      pass: decryptSecret(imapCred.encryptedValue, config.encryptionKey),
+    }
+  }
+
+  const connectedMethod = oauthCred && oauthMeta.email && googleClient ? 'oauth' : imapCred && imapMeta.email ? 'imap' : null
+  const connectedMeta = connectedMethod === 'oauth' ? oauthMeta : connectedMethod === 'imap' ? imapMeta : null
   return {
-    mailbox: {
-      host: meta.host || DEFAULT_IMAP_HOST,
-      port: meta.port || DEFAULT_IMAP_PORT,
-      user: meta.email,
-      pass: decryptSecret(gmail.encryptedValue, config.encryptionKey),
+    info: {
+      configured: credentials !== null,
+      method: connectedMethod,
+      email: connectedMeta?.email ?? null,
+      googleSignInAvailable: googleClient !== null,
+      aiReady: anthropicApiKey !== null,
+      lastScanAt: connectedMeta?.lastScanAt ? new Date(connectedMeta.lastScanAt) : null,
     },
-    anthropicApiKey: decryptSecret(anthropic.encryptedValue, config.encryptionKey),
-    gmailCredentialId: gmail.id,
-    lastScanAt: meta.lastScanAt ? new Date(meta.lastScanAt) : null,
+    credentials,
   }
 }
 
@@ -121,11 +201,11 @@ export async function runScan(
   const state = getScanState(workspaceId)
   if (state.running) throw new AppError(409, 'A scan is already running for this workspace')
 
-  const credentials = await loadScanCredentials(prisma, config, workspaceId)
+  const { credentials } = await resolveScanSetup(prisma, config, workspaceId)
   if (!credentials) {
     throw new AppError(
       400,
-      'Inbox scanning is not configured — store the Gmail mailbox and Anthropic API key credentials first',
+      'Inbox scanning is not configured — connect the Gmail inbox, and make sure the platform AI key is set',
     )
   }
 
@@ -139,12 +219,23 @@ export async function runScan(
       ? new Date(credentials.lastScanAt.getTime() - RESCAN_OVERLAP_MS)
       : new Date(startedAt.getTime() - FIRST_SCAN_LOOKBACK_MS)
 
-    const emails = await deps.fetchEmails(credentials.mailbox, since, MAX_EMAILS_PER_SCAN)
+    const mailbox: MailboxConfig = { host: credentials.host, port: credentials.port, user: credentials.email }
+    if (credentials.method === 'oauth') {
+      mailbox.accessToken = await googleOauth.refreshAccessToken({
+        clientId: credentials.googleClient!.clientId,
+        clientSecret: credentials.googleClient!.clientSecret,
+        refreshToken: credentials.refreshToken!,
+      })
+    } else {
+      mailbox.pass = credentials.pass
+    }
+
+    const emails = await deps.fetchEmails(mailbox, since, MAX_EMAILS_PER_SCAN)
 
     const result: ScanResult = { at: startedAt.toISOString(), scanned: emails.length, imported: 0, updated: 0, skipped: 0, errors: [] }
     for (const email of emails) {
       // Never score the workspace's own outbound mail that lands in INBOX.
-      if (email.from.address === credentials.mailbox.user.toLowerCase()) {
+      if (email.from.address === credentials.email.toLowerCase()) {
         result.skipped++
         continue
       }
@@ -192,11 +283,11 @@ export async function runScan(
     }
 
     // Advance the scan cursor (merge — keep email/host in meta).
-    const gmail = await prisma.credential.findUnique({ where: { id: credentials.gmailCredentialId } })
-    if (gmail) {
+    const cursorRow = await prisma.credential.findUnique({ where: { id: credentials.credentialId } })
+    if (cursorRow) {
       await prisma.credential.update({
-        where: { id: gmail.id },
-        data: { meta: { ...(gmail.meta as object), lastScanAt: startedAt.toISOString() } },
+        where: { id: cursorRow.id },
+        data: { meta: { ...(cursorRow.meta as object), lastScanAt: startedAt.toISOString() } },
       })
     }
 

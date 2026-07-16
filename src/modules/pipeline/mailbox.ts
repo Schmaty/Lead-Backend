@@ -14,7 +14,10 @@ export interface MailboxConfig {
   host: string
   port: number
   user: string
-  pass: string
+  /** App password (IMAP basic auth). Exactly one of pass / accessToken is set. */
+  pass?: string
+  /** OAuth access token (XOAUTH2) — the sign-in path clients use. */
+  accessToken?: string
 }
 
 const stripHtml = (html: string): string =>
@@ -40,7 +43,9 @@ export async function fetchRecentEmails(
     host: config.host,
     port: config.port,
     secure: true,
-    auth: { user: config.user, pass: config.pass },
+    auth: config.accessToken
+      ? { user: config.user, accessToken: config.accessToken }
+      : { user: config.user, pass: config.pass ?? '' },
     logger: false,
   })
   await client.connect()

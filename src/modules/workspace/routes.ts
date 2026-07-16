@@ -3,7 +3,7 @@ import type { Prisma } from '@prisma/client'
 import { z } from 'zod'
 import { generateApiKey } from '../../crypto/hashing.js'
 import { decryptSecret, encryptSecret, maskSecret } from '../../crypto/secrets.js'
-import { authGuard, requireRole } from '../../middleware/authGuard.js'
+import { authGuard, isDeveloper, requireDeveloper, requireRole } from '../../middleware/authGuard.js'
 import { AppError } from '../../middleware/errorHandler.js'
 import { workspaceId } from '../../middleware/workspaceScope.js'
 import { audit } from '../../services/audit.js'
@@ -11,12 +11,17 @@ import { applyComputed } from '../../services/leadCompute.js'
 import { resolveSettings, type WorkspaceSettings } from '../../types/settings.js'
 
 /**
- * ANTHROPIC_API_KEY + GMAIL_IMAP power the built-in inbox scanner;
- * N8N_WEBHOOK arms HMAC verification on the optional ingest webhook.
+ * Raw workspace secrets a developer may paste: GMAIL_IMAP is the app-password
+ * fallback for the inbox scanner; N8N_WEBHOOK arms HMAC verification on the
+ * optional ingest webhook. Clients connect their mailbox by signing in with
+ * Google instead (POST /workspace/gmail/connect), which stores GMAIL_OAUTH.
  */
-export const CREDENTIAL_KINDS = ['ANTHROPIC_API_KEY', 'GMAIL_IMAP', 'N8N_WEBHOOK'] as const
+export const CREDENTIAL_KINDS = ['GMAIL_IMAP', 'N8N_WEBHOOK'] as const
+/** Kinds a workspace admin may disconnect — includes sign-in and legacy rows. */
+const DELETABLE_KINDS = ['GMAIL_IMAP', 'N8N_WEBHOOK', 'GMAIL_OAUTH', 'ANTHROPIC_API_KEY'] as const
 
 const credentialKindSchema = z.enum(CREDENTIAL_KINDS)
+const deletableKindSchema = z.enum(DELETABLE_KINDS)
 
 const credentialPutSchema = z
   .object({
@@ -62,6 +67,7 @@ export default async function workspaceRoutes(app: FastifyInstance): Promise<voi
   const { prisma, config } = app
   const guard = authGuard(app)
   const adminOnly = requireRole('OWNER', 'ADMIN')
+  const developerOnly = requireDeveloper(app)
 
   // ── Workspace + settings ───────────────────────────────────────────────────
   app.get('/', { preHandler: [guard] }, async (request) => {
@@ -81,6 +87,7 @@ export default async function workspaceRoutes(app: FastifyInstance): Promise<voi
         name: user.name,
         email: user.email,
         role: user.role,
+        developer: isDeveloper(config, user.email),
         lastLoginAt: user.lastLoginAt,
       })),
     }
@@ -95,6 +102,7 @@ export default async function workspaceRoutes(app: FastifyInstance): Promise<voi
         name: user.name,
         email: user.email,
         role: user.role,
+        developer: isDeveloper(config, user.email),
         lastLoginAt: user.lastLoginAt,
       })),
     }
@@ -188,7 +196,7 @@ export default async function workspaceRoutes(app: FastifyInstance): Promise<voi
     }
   })
 
-  app.put('/credentials/:kind', { preHandler: [guard, adminOnly] }, async (request) => {
+  app.put('/credentials/:kind', { preHandler: [guard, developerOnly] }, async (request) => {
     const auth = request.auth!
     const wsId = workspaceId(request)
     const kind = credentialKindSchema.parse((request.params as { kind: string }).kind)
@@ -211,18 +219,19 @@ export default async function workspaceRoutes(app: FastifyInstance): Promise<voi
     }
   })
 
+  // Disconnecting an integration (incl. the Gmail sign-in) is a client action.
   app.delete('/credentials/:kind', { preHandler: [guard, adminOnly] }, async (request) => {
     const auth = request.auth!
     const wsId = workspaceId(request)
-    const kind = credentialKindSchema.parse((request.params as { kind: string }).kind)
+    const kind = deletableKindSchema.parse((request.params as { kind: string }).kind)
     const result = await prisma.credential.deleteMany({ where: { workspaceId: wsId, kind } })
     if (result.count === 0) throw new AppError(404, 'Credential not found')
     await audit(prisma, { workspaceId: wsId, userId: auth.userId, action: 'credential.deleted', target: kind, ip: request.ip })
     return { ok: true }
   })
 
-  // ── Ingest API keys ────────────────────────────────────────────────────────
-  app.get('/api-keys', { preHandler: [guard, adminOnly] }, async (request) => {
+  // ── Ingest API keys (developer-only: machine credentials for external push) ─
+  app.get('/api-keys', { preHandler: [guard, developerOnly] }, async (request) => {
     const wsId = workspaceId(request)
     const keys = await prisma.apiKey.findMany({ where: { workspaceId: wsId }, orderBy: { createdAt: 'desc' } })
     return {
@@ -238,7 +247,7 @@ export default async function workspaceRoutes(app: FastifyInstance): Promise<voi
     }
   })
 
-  app.post('/api-keys', { preHandler: [guard, adminOnly] }, async (request, reply) => {
+  app.post('/api-keys', { preHandler: [guard, developerOnly] }, async (request, reply) => {
     const auth = request.auth!
     const wsId = workspaceId(request)
     const body = apiKeyCreateSchema.parse(request.body)
@@ -256,7 +265,7 @@ export default async function workspaceRoutes(app: FastifyInstance): Promise<voi
     })
   })
 
-  app.delete('/api-keys/:id', { preHandler: [guard, adminOnly] }, async (request) => {
+  app.delete('/api-keys/:id', { preHandler: [guard, developerOnly] }, async (request) => {
     const auth = request.auth!
     const wsId = workspaceId(request)
     const { id } = request.params as { id: string }

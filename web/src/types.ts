@@ -5,6 +5,7 @@ export interface UserInfo {
   name: string
   email: string
   role: Role
+  developer?: boolean
   lastLoginAt: string | null
 }
 
@@ -109,6 +110,8 @@ export interface SessionUser {
   name: string
   email: string
   role: Role
+  /** True for the allowlisted platform developer account. */
+  developer?: boolean
   lastLoginAt: string | null
   createdAt: string
 }
@@ -227,6 +230,10 @@ export interface ScanResult {
 
 export interface ScanStatus {
   configured: boolean
+  method: 'oauth' | 'imap' | null
+  email: string | null
+  googleSignInAvailable: boolean
+  aiReady: boolean
   running: boolean
   lastScanAt: string | null
   pollMinutes: number
