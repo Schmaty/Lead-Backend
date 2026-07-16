@@ -149,7 +149,7 @@ export interface Desk {
   markSent: (id: string, stage: string) => Promise<void>
   saveSettings: (patch: Record<string, unknown>) => Promise<boolean>
   loadAdminData: () => Promise<void>
-  saveCredential: (kind: string, value: string) => Promise<void>
+  saveCredential: (kind: string, value: string, meta?: Record<string, unknown>) => Promise<void>
   removeCredential: (kind: string) => Promise<void>
   createKey: (name: string) => Promise<void>
   revokeKey: (id: string) => Promise<void>
@@ -376,9 +376,9 @@ export function DeskProvider({ children }: { children: ReactNode }): ReactNode {
     }
   }
 
-  const saveCredential = async (kind: string, value: string): Promise<void> => {
+  const saveCredential = async (kind: string, value: string, meta?: Record<string, unknown>): Promise<void> => {
     try {
-      await api.putCredential(kind, value)
+      await api.putCredential(kind, value, meta)
       const creds = await api.credentials()
       set({ credentials: creds.credentials })
       toast('Credential stored. Only the masked value stays readable.')

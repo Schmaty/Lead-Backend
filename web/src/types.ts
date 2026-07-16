@@ -215,3 +215,21 @@ export const defaultColumns = (): Columns => ({
   follow_up: true,
   last: false,
 })
+
+export interface ScanResult {
+  at: string
+  scanned: number
+  imported: number
+  updated: number
+  skipped: number
+  errors: string[]
+}
+
+export interface ScanStatus {
+  configured: boolean
+  running: boolean
+  lastScanAt: string | null
+  pollMinutes: number
+  lastResult: ScanResult | null
+  lastError: string | null
+}

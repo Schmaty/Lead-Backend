@@ -10,7 +10,11 @@ import { audit } from '../../services/audit.js'
 import { applyComputed } from '../../services/leadCompute.js'
 import { resolveSettings, type WorkspaceSettings } from '../../types/settings.js'
 
-export const CREDENTIAL_KINDS = ['ANTHROPIC_API_KEY', 'GMAIL_OAUTH', 'N8N_WEBHOOK', 'GOOGLE_SHEET'] as const
+/**
+ * ANTHROPIC_API_KEY + GMAIL_IMAP power the built-in inbox scanner;
+ * N8N_WEBHOOK arms HMAC verification on the optional ingest webhook.
+ */
+export const CREDENTIAL_KINDS = ['ANTHROPIC_API_KEY', 'GMAIL_IMAP', 'N8N_WEBHOOK'] as const
 
 const credentialKindSchema = z.enum(CREDENTIAL_KINDS)
 
