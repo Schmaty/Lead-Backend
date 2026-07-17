@@ -9,6 +9,7 @@ import {
   type AmbientMeeting,
 } from '../../services/ambient.js'
 import { syncLeadCrm } from '../../services/crmSync.js'
+import { listOpenLeads } from '../../services/zoho.js'
 import { upsertLeadByExternalId, type UpsertThread } from '../../services/leadUpsert.js'
 import { upsertPerson } from '../../services/people.js'
 import {
@@ -48,6 +49,10 @@ const MAX_SENT_PER_SCAN = 50
 const FIRST_SCAN_LOOKBACK_MS = 7 * 24 * 3600 * 1000
 /** Subsequent scans re-read a little history; the idempotent upsert dedupes. */
 const RESCAN_OVERLAP_MS = 60 * 60 * 1000
+/** The one-shot Import reaches much further back and reads much more. */
+const IMPORT_LOOKBACK_MS = 90 * 24 * 3600 * 1000
+const IMPORT_MAX_EMAILS = 200
+const IMPORT_MAX_CRM_LEADS = 50
 
 export interface ScanResult {
   at: string
@@ -316,11 +321,20 @@ async function resolveThreadKey(
  * team's own replies, marks replySent, and advances brand-new leads to the
  * contacted stage. Human edits and manual winProbability overrides survive.
  */
+export interface ScanOptions {
+  /**
+   * Deep import: 90-day email lookback, higher caps, and Zoho's open leads
+   * pulled in as Leadline leads (auto-categorized by the scorer).
+   */
+  deep?: boolean
+}
+
 export async function runScan(
   prisma: PrismaClient,
   config: AppConfig,
   workspaceId: string,
   deps: ScanDeps = defaultDeps,
+  options: ScanOptions = {},
 ): Promise<ScanResult> {
   const state = getScanState(workspaceId)
   if (state.running) throw new AppError(409, 'A scan is already running for this workspace')
@@ -341,9 +355,12 @@ export async function runScan(
   try {
     const workspace = await prisma.workspace.findUniqueOrThrow({ where: { id: workspaceId } })
     const settings = resolveSettings(workspace.settings)
-    const since = credentials.lastScanAt
-      ? new Date(credentials.lastScanAt.getTime() - RESCAN_OVERLAP_MS)
-      : new Date(startedAt.getTime() - FIRST_SCAN_LOOKBACK_MS)
+    const since = options.deep
+      ? new Date(startedAt.getTime() - IMPORT_LOOKBACK_MS)
+      : credentials.lastScanAt
+        ? new Date(credentials.lastScanAt.getTime() - RESCAN_OVERLAP_MS)
+        : new Date(startedAt.getTime() - FIRST_SCAN_LOOKBACK_MS)
+    const emailCap = options.deep ? IMPORT_MAX_EMAILS : MAX_EMAILS_PER_SCAN
 
     const mailbox: MailboxConfig = { host: credentials.host, port: credentials.port, user: credentials.email }
     if (credentials.method === 'oauth') {
@@ -356,7 +373,7 @@ export async function runScan(
       mailbox.pass = credentials.pass
     }
 
-    const emails = await deps.fetchEmails(mailbox, since, MAX_EMAILS_PER_SCAN)
+    const emails = await deps.fetchEmails(mailbox, since, emailCap)
     const result: ScanResult = { at: startedAt.toISOString(), scanned: emails.length, imported: 0, merged: 0, updated: 0, skipped: 0, ignored: 0, replies: 0, meetings: 0, crm: 0, errors: [] }
     const ownAddress = credentials.email.toLowerCase()
 
@@ -572,6 +589,79 @@ export async function runScan(
     // ── Pull the CRM's view of leads (read-only; push stays coming-soon) ────
     if (credentials.zoho) {
       progress.phase = 'crm'
+
+      // Deep import: every open Zoho lead becomes a Leadline lead,
+      // auto-categorized by the scorer from the CRM record itself.
+      if (options.deep) {
+        try {
+          const openLeads = await listOpenLeads(credentials.zoho, IMPORT_MAX_CRM_LEADS)
+          for (const open of openLeads) {
+            try {
+              const email = open.record.email.toLowerCase()
+              const known = await prisma.lead.findFirst({
+                where: { workspaceId, deletedAt: null, OR: [{ email }, { people: { some: { email } } }] },
+                select: { id: true },
+              })
+              if (known) continue
+              const synthetic: InboundEmail = {
+                messageId: `zoho:${open.record.id}`,
+                from: { name: open.record.name, address: email },
+                to: [credentials.email],
+                subject: `CRM lead: ${open.record.name}${open.record.company ? ` — ${open.record.company}` : ''}`,
+                date: startedAt,
+                text: [
+                  `Imported from Zoho CRM (status: ${open.status || 'unknown'}).`,
+                  open.record.company ? `Company: ${open.record.company}` : '',
+                  open.description,
+                ].filter(Boolean).join('\n'),
+                references: [],
+                inReplyTo: null,
+              }
+              const scored = await deps.scoreEmail(
+                credentials.anthropicApiKey, synthetic, settings, workspace.name, undefined, credentials.scorerModel,
+              )
+              const { lead } = await upsertLeadByExternalId(prisma, workspaceId, settings, {
+                externalId: synthetic.messageId,
+                receivedAt: startedAt,
+                name: scored.name || open.record.name,
+                email,
+                org: scored.org || open.record.company,
+                source: 'CRM import',
+                inquiryType: scored.inquiryType,
+                summary: scored.summary,
+                fitScore: scored.fitScore,
+                urgencyScore: scored.urgencyScore,
+                leadScore: scored.leadScore,
+                dealValueLow: scored.dealValueLow,
+                dealValueHigh: scored.dealValueHigh,
+                estPayoutRaw: scored.estPayoutRaw,
+                estWork: scored.estWork,
+                recommendedNextStep: scored.recommendedNextStep,
+                draftReply: scored.draftReply,
+                fitReasons: scored.fitReasons,
+                riskFlags: scored.riskFlags,
+                inferredFields: scored.inferredFields,
+                threads: [],
+                initialStage: 'New',
+                createdDetail: `Imported from Zoho CRM (${open.record.name})`,
+              }, { threadMode: 'merge' })
+              touchedLeadIds.add(lead.id)
+              await upsertPerson(prisma, lead.id, { name: open.record.name, email, role: 'Reached out', seenAt: startedAt })
+              if (open.record.phone) {
+                const person = await prisma.person.findFirst({ where: { leadId: lead.id, email } })
+                if (person && !person.phone) await prisma.person.update({ where: { id: person.id }, data: { phone: open.record.phone } })
+              }
+              result.imported++
+              progress.imported++
+            } catch (err) {
+              result.errors.push(`crm import "${open.record.name}": ${err instanceof Error ? err.message : String(err)}`)
+            }
+          }
+        } catch (err) {
+          result.errors.push(`crm import: ${err instanceof Error ? err.message : String(err)}`)
+        }
+      }
+
       try {
         const stale = await prisma.lead.findMany({
           where: { workspaceId, deletedAt: null, crmCheckedAt: null, id: { notIn: [...touchedLeadIds] } },

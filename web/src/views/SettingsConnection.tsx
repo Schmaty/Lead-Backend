@@ -282,6 +282,25 @@ export default function ConnectionTab(): ReactNode {
           >
             {scan?.running ? 'Scanning…' : 'Scan now'}
           </button>
+          <button
+            onClick={() => {
+              if (window.confirm('Import everything? This reads the last 90 days of email and meetings plus your open CRM leads, and scores each one with AI. It can take a few minutes.')) {
+                void (async () => {
+                  try {
+                    await api.importHistory()
+                    setScan((s) => (s ? { ...s, running: true } : s))
+                    startPolling()
+                  } catch (e) {
+                    desk.toast(e instanceof Error ? e.message : 'Import failed to start')
+                  }
+                })()
+              }
+            }}
+            disabled={!configured || !!scan?.running}
+            style={{ background: '#fff', border: `1px solid ${A}`, color: A, borderRadius: 7, padding: '8px 14px', fontSize: 13, fontWeight: 600, cursor: !configured || scan?.running ? 'default' : 'pointer', opacity: !configured || scan?.running ? 0.5 : 1 }}
+          >
+            Import history
+          </button>
           <div style={{ display: 'flex', border: `1px solid ${C.border2}`, borderRadius: 8, overflow: 'hidden', flexWrap: 'wrap' }}>
             {([[5, 'Every 5 min'], [15, 'Every 15 min'], [60, 'Hourly'], [240, 'Every 4 hours']] as const).map(([minutes, label]) => {
               const active = settings.scanSettings.pollMinutes === minutes

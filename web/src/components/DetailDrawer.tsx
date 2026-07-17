@@ -88,7 +88,7 @@ export default function DetailDrawer(): ReactNode {
     probTimer.current = setTimeout(() => void desk.updateLead(lead.id, { winProbability: Math.max(0, Math.min(1, pct / 100)) }), 350)
   }
   const canDelete = st.user!.role !== 'MEMBER'
-  // Probability math is developer-only; daily users see plain dollar figures.
+  // Technical internals (probability math, raw thread ids) are developer-only.
   const showTechnical = !!st.user?.developer
 
   return (
@@ -100,7 +100,7 @@ export default function DetailDrawer(): ReactNode {
             <div style={{ minWidth: 0 }}>
               <div style={{ display: 'flex', alignItems: 'center', gap: 9, flexWrap: 'wrap' }}>
                 <span style={chipStyle(view.tier)}>{chip.label}</span>
-                <span style={{ fontSize: 11, color: C.faint, fontFamily: mono }}>#{lead.externalId ?? lead.id.slice(-8)}</span>
+                {showTechnical && <span style={{ fontSize: 11, color: C.faint, fontFamily: mono }}>#{lead.externalId ?? lead.id.slice(-8)}</span>}
               </div>
               <div style={{ fontFamily: serif, fontSize: 23, fontWeight: 600, marginTop: 9, lineHeight: 1.15, textWrap: 'pretty' }}>{lead.name}</div>
               {!!lead.org && <div style={{ fontSize: 14, color: C.body, marginTop: 2 }}>{lead.org}</div>}

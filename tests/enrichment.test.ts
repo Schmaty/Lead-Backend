@@ -353,6 +353,36 @@ describe('Zoho CRM', () => {
     }
   })
 
+  it('the one-shot import pulls open Zoho leads in and auto-categorizes them', async () => {
+    clearZohoTokenCacheForTesting()
+    const restore = setZohoDepsForTesting({
+      async fetchJson(url) {
+        if (url.includes('/oauth/v2/token')) return { status: 200, json: { access_token: 'zoho-access-3', expires_in: 3600 } }
+        if (url.includes('/crm/v8/Leads?fields=')) {
+          return {
+            status: 200,
+            json: { data: [{ id: 'z-500', First_Name: 'Sky', Last_Name: 'Tanaka', Email: 'sky@newco.example', Company: 'NewCo', Phone: '+1 555 0200', Description: 'Met at conference; wants AI training.', Lead_Status: 'Open' }] },
+          }
+        }
+        return { status: 204, json: null }
+      },
+    })
+    try {
+      const result = await runScan(app.prisma, testConfig(ENV), owner.workspace.id, deps([]), { deep: true })
+      expect(result.imported).toBe(1)
+      expect(result.errors).toEqual([])
+    } finally {
+      restore()
+    }
+    const list = await api(app, owner, { method: 'GET', url: '/api/v1/leads?pageSize=50' })
+    const imported = list.json().items.find((l: { externalId: string | null }) => l.externalId === 'zoho:z-500')
+    expect(imported.source).toBe('CRM import')
+    expect(imported.email).toBe('sky@newco.example')
+    // Re-import is idempotent — the lead already exists by email.
+    const again = await runScan(app.prisma, testConfig(ENV), owner.workspace.id, deps([]), { deep: true })
+    expect(again.imported).toBe(0)
+  })
+
   it('push to CRM is built but gated: 501 coming soon', async () => {
     const detail = await leadDetail()
     const res = await api(app, owner, { method: 'POST', url: `/api/v1/leads/${detail.id}/crm/push` })

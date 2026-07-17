@@ -146,3 +146,34 @@ export async function searchCrmByEmails(config: ZohoConfig, emails: string[]): P
   }
   return [...records.values()]
 }
+
+export interface OpenCrmLead {
+  record: CrmRecord
+  description: string
+  status: string
+}
+
+/**
+ * The open (unconverted) records in Zoho's Leads module — the pool the
+ * one-shot import turns into Leadline leads. Records without an email are
+ * skipped (no reliable dedupe key).
+ */
+export async function listOpenLeads(config: ZohoConfig, limit = 50): Promise<OpenCrmLead[]> {
+  const token = await getAccessToken(config)
+  const fields = 'First_Name,Last_Name,Full_Name,Email,Company,Phone,Mobile,Description,Lead_Status'
+  const { status, json } = await deps.fetchJson(
+    `${config.apiDomain}/crm/v8/Leads?fields=${encodeURIComponent(fields)}&per_page=${Math.min(limit, 200)}&converted=false`,
+    { headers: { Authorization: `Zoho-oauthtoken ${token}` } },
+  )
+  if (status === 204 || json == null) return []
+  if (status !== 200) throw new Error(`Zoho Leads list failed (HTTP ${status})`)
+  const rows = ((json as { data?: Array<ZohoRow & { Description?: string | null; Lead_Status?: string | null }> }).data ?? [])
+  return rows
+    .filter((row) => row.Email)
+    .slice(0, limit)
+    .map((row) => ({
+      record: normalizeRow('Leads', row),
+      description: row.Description ?? '',
+      status: row.Lead_Status ?? '',
+    }))
+}

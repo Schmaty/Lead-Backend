@@ -160,6 +160,7 @@ export default function SettingsView(): ReactNode {
               </div>
             </div>
           </div>
+          {desk.st.user?.developer && (
           <div style={card}>
             <div style={sectionTitle}>Win-probability mapping</div>
             <div style={sectionDesc}>
@@ -184,6 +185,7 @@ export default function SettingsView(): ReactNode {
               ))}
             </div>
           </div>
+          )}
         </div>
       )}
 

@@ -55,6 +55,26 @@ export default async function pipelineRoutes(app: FastifyInstance): Promise<void
     return reply.status(202).send({ started: true })
   })
 
+  // ── One-shot import: 90 days of email + meetings + Zoho's open leads ─────
+  app.post('/import', { preHandler: [guard, adminOnly] }, async (request, reply) => {
+    const auth = request.auth!
+    const wsId = workspaceId(request)
+    const state = getScanState(wsId)
+    if (state.running) throw new AppError(409, 'A scan is already running for this workspace')
+    const { credentials } = await resolveScanSetup(prisma, config, wsId)
+    if (!credentials) {
+      throw new AppError(
+        400,
+        'Inbox scanning is not configured — connect the Gmail inbox, and make sure the platform AI key is set',
+      )
+    }
+    void runScan(prisma, config, wsId, undefined, { deep: true }).catch((err) => {
+      app.log.error({ err, workspaceId: wsId }, 'import failed')
+    })
+    await audit(prisma, { workspaceId: wsId, userId: auth.userId, action: 'pipeline.import_started', target: 'history', ip: request.ip })
+    return reply.status(202).send({ started: true })
+  })
+
   // ── Scan status (any signed-in member) ───────────────────────────────────
   app.get('/scan/status', { preHandler: [guard] }, async (request) => {
     const wsId = workspaceId(request)

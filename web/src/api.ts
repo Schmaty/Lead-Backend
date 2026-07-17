@@ -145,6 +145,8 @@ export const api = {
     }),
   deleteCredential: (kind: string) => request<{ ok: boolean }>(`/workspace/credentials/${kind}`, { method: 'DELETE' }),
   scan: () => request<{ started: boolean }>('/workspace/scan', { method: 'POST' }),
+  /** One-shot deep import: 90 days of email + meetings + Zoho's open leads. */
+  importHistory: () => request<{ started: boolean }>('/workspace/import', { method: 'POST' }),
   scanStatus: () => request<ScanStatus>('/workspace/scan/status'),
   /** Start the Google sign-in that connects this workspace's inbox. */
   gmailConnect: () => request<{ url: string }>('/workspace/gmail/connect', { method: 'POST' }),
