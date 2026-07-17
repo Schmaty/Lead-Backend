@@ -78,6 +78,7 @@ function deps(emails: InboundEmail[], options: Options = {}): ScanDeps {
     },
     listMeetings: async () => options.meetings ?? [],
     getMeetingInsight: async (_config, insightId) => options.insights?.[insightId] ?? { tldr: '', text: '' },
+    classifyEmail: async () => ({ decision: 'unsure' as const, confidence: 0.5, reason: 'test default' }),
   }
 }
 

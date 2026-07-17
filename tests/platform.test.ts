@@ -229,6 +229,7 @@ describe('Gmail connect (sign-in) flow', () => {
       scoreEmail: async () => scored,
       listMeetings: async () => [],
       getMeetingInsight: async () => ({ tldr: '', text: '' }),
+      classifyEmail: async () => ({ decision: 'unsure', confidence: 0.5, reason: 'test' }),
     })
     try {
       const result = await runScan(app.prisma, testConfig(ENV), client.workspace.id)

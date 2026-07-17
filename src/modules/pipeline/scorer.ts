@@ -142,3 +142,46 @@ export function normalizeScoredLead(raw: ScoredLead, settings: WorkspaceSettings
     dealValueHigh: Math.max(0, high),
   }
 }
+
+/** Cheapest fast model — its only job is the relevance gate. */
+export const GATE_MODEL = 'claude-haiku-4-5'
+
+const relevanceSchema = z.object({
+  decision: z.enum(['relevant', 'irrelevant', 'unsure']).describe('relevant = a possible business inquiry worth full scoring; irrelevant = clearly not; unsure = escalate'),
+  confidence: z.number().min(0).max(1).describe('How certain you are, 0-1'),
+  reason: z.string().describe('One short sentence'),
+})
+
+export type RelevanceVerdict = z.infer<typeof relevanceSchema>
+
+/**
+ * Cheap relevance gate, run before the expensive scorer on new conversations.
+ * Irrelevant: newsletters, receipts, automated/calendar notifications,
+ * delivery failures, vendor/SEO pitches selling TO the business, promotions,
+ * generic spam, cold outreach with no buyer intent. Relevant: training /
+ * consulting / workshop / speaking inquiries, partnership requests with
+ * possible revenue, replies from prospects, orgs asking about AI programs,
+ * and vague-but-real business inquiries. Uncertainty escalates — never drops.
+ */
+export async function classifyRelevance(
+  client: Anthropic,
+  email: InboundEmail,
+  settings: WorkspaceSettings,
+  workspaceName: string,
+): Promise<RelevanceVerdict> {
+  const response = await client.messages.parse({
+    model: GATE_MODEL,
+    max_tokens: 2000,
+    system: [
+      `You are a fast relevance filter for "${workspaceName}", a business that sells training/consulting services. Decide ONLY whether this inbound email could be a genuine business inquiry worth deeper analysis.`,
+      'IRRELEVANT: newsletters, receipts, automated or calendar notifications, delivery failures, vendor/SEO pitches selling TO the business, promotions, generic spam, cold outreach with no real buyer intent, job applications.',
+      `RELEVANT: inquiries about ${settings.inquiryTypes.join(', ')}; consulting/advisory/workshop/speaking requests; partnership requests with possible revenue; replies from current prospects; schools/companies asking about AI programs; vague but real business inquiries.`,
+      'If in doubt, say "unsure" — uncertain emails are escalated, never discarded.',
+    ].join('\n'),
+    messages: [{ role: 'user', content: `From: ${email.from.name} <${email.from.address}>\nSubject: ${email.subject}\n\n${email.text.slice(0, 2500)}` }],
+    output_config: { format: zodOutputFormat(relevanceSchema) },
+  })
+  const parsed = response.parsed_output
+  if (!parsed) throw new Error(`Relevance gate returned no parseable output (stop_reason: ${response.stop_reason})`)
+  return parsed
+}

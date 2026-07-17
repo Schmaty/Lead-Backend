@@ -30,7 +30,7 @@ import {
   type InboundEmail,
   type MailboxConfig,
 } from './mailbox.js'
-import { createAnthropic, scoreEmail, type ConversationContext, type ScoredLead } from './scorer.js'
+import { classifyRelevance, createAnthropic, scoreEmail, type ConversationContext, type RelevanceVerdict, type ScoredLead } from './scorer.js'
 
 /** Client sign-in path: value = Google refresh token, meta = { email, lastScanAt }. */
 export const GMAIL_OAUTH_KIND = 'GMAIL_OAUTH'
@@ -41,8 +41,12 @@ const LEGACY_ANTHROPIC_KIND = 'ANTHROPIC_API_KEY'
 
 const DEFAULT_IMAP_HOST = 'imap.gmail.com'
 const DEFAULT_IMAP_PORT = 993
-/** Cap per scan so one run can't burn unbounded Anthropic spend. */
-const MAX_EMAILS_PER_SCAN = 25
+/** Per-scan cap — the cheap gate makes wide coverage affordable. When the cap
+ * is hit, the cursor only advances to the newest processed email, so the rest
+ * of the window is picked up next scan instead of being skipped forever. */
+const MAX_EMAILS_PER_SCAN = 100
+/** Gate skips only when it is confidently irrelevant; below this, escalate. */
+const GATE_SKIP_CONFIDENCE = 0.75
 /** Sent mail costs no AI calls — a wider window keeps reply tracking complete. */
 const MAX_SENT_PER_SCAN = 50
 /** First-ever scan looks back this far. */
@@ -125,6 +129,13 @@ export interface ScanDeps {
   ) => Promise<ScoredLead>
   listMeetings: (config: AmbientConfig, since: Date) => Promise<AmbientMeeting[]>
   getMeetingInsight: (config: AmbientConfig, insightId: string) => Promise<AmbientInsight>
+  /** Cheap relevance gate (Haiku) run before the expensive scorer on new conversations. */
+  classifyEmail: (
+    apiKey: string,
+    email: InboundEmail,
+    settings: WorkspaceSettings,
+    workspaceName: string,
+  ) => Promise<RelevanceVerdict>
 }
 
 let defaultDeps: ScanDeps = {
@@ -134,6 +145,8 @@ let defaultDeps: ScanDeps = {
     scoreEmail(createAnthropic(apiKey), email, settings, workspaceName, context, model),
   listMeetings: (config, since) => listPastMeetings(config, since),
   getMeetingInsight: (config, insightId) => getInsight(config, insightId),
+  classifyEmail: (apiKey, email, settings, workspaceName) =>
+    classifyRelevance(createAnthropic(apiKey), email, settings, workspaceName),
 }
 
 /** Test hook: swap the IMAP/Anthropic edges for fakes. Returns a restore fn. */
@@ -327,6 +340,8 @@ export interface ScanOptions {
    * pulled in as Leadline leads (auto-categorized by the scorer).
    */
   deep?: boolean
+  /** Test hook: shrink the per-scan email cap. */
+  emailCap?: number
 }
 
 export async function runScan(
@@ -360,7 +375,7 @@ export async function runScan(
       : credentials.lastScanAt
         ? new Date(credentials.lastScanAt.getTime() - RESCAN_OVERLAP_MS)
         : new Date(startedAt.getTime() - FIRST_SCAN_LOOKBACK_MS)
-    const emailCap = options.deep ? IMPORT_MAX_EMAILS : MAX_EMAILS_PER_SCAN
+    const emailCap = options.emailCap ?? (options.deep ? IMPORT_MAX_EMAILS : MAX_EMAILS_PER_SCAN)
 
     const mailbox: MailboxConfig = { host: credentials.host, port: credentials.port, user: credentials.email }
     if (credentials.method === 'oauth') {
@@ -377,6 +392,35 @@ export async function runScan(
     const result: ScanResult = { at: startedAt.toISOString(), scanned: emails.length, imported: 0, merged: 0, updated: 0, skipped: 0, ignored: 0, replies: 0, meetings: 0, crm: 0, errors: [] }
     const ownAddress = credentials.email.toLowerCase()
 
+    /** Audit invariant: every scanned message gets a fate on record. Never throws. */
+    const logMessage = async (
+      email: InboundEmail,
+      threadRootId: string,
+      status: string,
+      extra: { decision?: string; confidence?: number; reason?: string; lastError?: string } = {},
+    ): Promise<void> => {
+      try {
+        const fields = {
+          threadRootId,
+          subject: email.subject.slice(0, 200),
+          fromEmail: email.from.address,
+          receivedAt: email.date,
+          status,
+          decision: extra.decision ?? '',
+          confidence: extra.confidence ?? null,
+          reason: (extra.reason ?? '').slice(0, 300),
+          lastError: (extra.lastError ?? '').slice(0, 300),
+        }
+        await prisma.scannedMessage.upsert({
+          where: { workspaceId_messageId: { workspaceId, messageId: email.messageId } },
+          create: { workspaceId, messageId: email.messageId, ...fields },
+          update: fields,
+        })
+      } catch {
+        /* the audit log must never break the scan */
+      }
+    }
+
     // ── Group inbound mail into conversations ────────────────────────────────
     const groups = new Map<string, InboundEmail[]>()
     for (const email of emails) {
@@ -384,6 +428,7 @@ export async function runScan(
       if (email.from.address === ownAddress) {
         result.skipped++
         progress.skipped++
+        await logMessage(email, email.messageId, 'skipped_own_sent')
         continue
       }
       const key = await resolveThreadKey(prisma, workspaceId, email)
@@ -416,6 +461,7 @@ export async function runScan(
           if (remembered) {
             result.ignored++
             progress.ignored++
+            for (const email of group) await logMessage(email, threadKey, 'skipped_irrelevant', { reason: 'previously ignored' })
             continue
           }
         }
@@ -426,10 +472,40 @@ export async function runScan(
           result.updated++
           progress.updated++
           progress.processed++
+          for (const email of group) await logMessage(email, threadKey, 'skipped_duplicate')
           continue
         }
 
         const newest = group[group.length - 1]!
+
+        // Cheap relevance gate — only for brand-new conversations. Replies to
+        // known leads always get full scoring; uncertainty escalates.
+        if (!existing) {
+          try {
+            const verdict = await deps.classifyEmail(credentials.anthropicApiKey, newest, settings, workspace.name)
+            if (verdict.decision === 'irrelevant' && verdict.confidence >= GATE_SKIP_CONFIDENCE) {
+              try {
+                await prisma.ignoredThread.create({
+                  data: { workspaceId, threadKey, subject: newest.subject.slice(0, 200), fromAddress: newest.from.address },
+                })
+              } catch { /* concurrent scan already recorded it */ }
+              result.ignored++
+              progress.ignored++
+              for (const email of group) {
+                await logMessage(email, threadKey, 'skipped_irrelevant', {
+                  decision: verdict.decision, confidence: verdict.confidence, reason: verdict.reason,
+                })
+              }
+              continue
+            }
+          } catch (err) {
+            // Gate failure = escalate to the full scorer, never drop.
+            await logMessage(newest, threadKey, 'failed_relevance', {
+              lastError: err instanceof Error ? err.message : String(err),
+            })
+          }
+        }
+
         const earlier = group.slice(0, -1)
         const context: ConversationContext | undefined =
           existing || earlier.length > 0
@@ -480,6 +556,9 @@ export async function runScan(
           }
           result.ignored++
           progress.ignored++
+          for (const email of group) {
+            await logMessage(email, threadKey, 'skipped_irrelevant', { decision: 'irrelevant', reason: 'full scorer judged not a real inquiry' })
+          }
           continue
         }
 
@@ -526,6 +605,9 @@ export async function runScan(
           result.updated++
           progress.updated++
         }
+        for (const email of group) {
+          await logMessage(email, threadKey, created ? 'processed_lead' : addedThreads > 0 ? 'merged_existing_lead' : 'skipped_duplicate')
+        }
 
         // Keep the person profile: the sender belongs to this lead, and their
         // messages hang off their profile via Thread.personId. On a merge the
@@ -542,7 +624,10 @@ export async function runScan(
           data: { personId },
         })
       } catch (err) {
-        result.errors.push(`"${group[0]!.subject}": ${err instanceof Error ? err.message : String(err)}`)
+        const message = err instanceof Error ? err.message : String(err)
+        result.errors.push(`"${group[0]!.subject}": ${message}`)
+        // Not added to the ignore list, so the next scan's window retries it.
+        for (const email of group) await logMessage(email, threadKey, 'failed_scoring', { lastError: message })
       } finally {
         progress.processed++
       }
@@ -687,12 +772,19 @@ export async function runScan(
       }
     }
 
-    // Advance the scan cursor (merge — keep email/host in meta).
+    // Advance the cursor only over what was actually covered: lastScanAt means
+    // "everything up to here has been processed". If the fetch hit the cap,
+    // the window wasn't fully read — advance only to the newest processed
+    // email so the remainder is picked up next scan, never skipped.
+    const fullyCovered = emails.length < emailCap
+    const floor = credentials.lastScanAt ?? since // the cursor never moves backward
+    const newestProcessed = emails.reduce((max, email) => (email.date > max ? email.date : max), floor)
+    const coveredUntil = fullyCovered ? startedAt : newestProcessed
     const cursorRow = await prisma.credential.findUnique({ where: { id: credentials.credentialId } })
     if (cursorRow) {
       await prisma.credential.update({
         where: { id: cursorRow.id },
-        data: { meta: { ...(cursorRow.meta as object), lastScanAt: startedAt.toISOString() } },
+        data: { meta: { ...(cursorRow.meta as object), lastScanAt: coveredUntil.toISOString() } },
       })
     }
 

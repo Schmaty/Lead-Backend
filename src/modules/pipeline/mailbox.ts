@@ -68,7 +68,7 @@ async function fetchFromMailbox(
   const lock = await client.getMailboxLock(path)
   try {
     const uids = await client.search({ since })
-    const recent = (Array.isArray(uids) ? uids : []).slice(-limit)
+    const recent = (Array.isArray(uids) ? uids : []).slice(0, limit) // oldest-first: partial windows resume next scan
     const emails: InboundEmail[] = []
     for (const uid of recent) {
       const message = await client.fetchOne(String(uid), { source: true })

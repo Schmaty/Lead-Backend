@@ -2,7 +2,7 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import type { FastifyInstance } from 'fastify'
 import type { InboundEmail, MailboxConfig } from '../src/modules/pipeline/mailbox.js'
 import { runScan, setScanDepsForTesting, type ScanDeps } from '../src/modules/pipeline/scanner.js'
-import { normalizeScoredLead, type ConversationContext, type ScoredLead } from '../src/modules/pipeline/scorer.js'
+import { normalizeScoredLead, type ConversationContext, type RelevanceVerdict, type ScoredLead } from '../src/modules/pipeline/scorer.js'
 import type { AmbientInsight, AmbientMeeting } from '../src/services/ambient.js'
 import { DEFAULT_SETTINGS } from '../src/types/settings.js'
 import { addMember, api, makeApp, resetDb, signup, testConfig, type Session } from './helpers.js'
@@ -85,6 +85,9 @@ const scoredFor: Record<string, ScoredLead> = {
 
 interface FakeDepOptions {
   sent?: InboundEmail[]
+  /** Per-message gate verdicts; default escalates everything to the full scorer. */
+  gate?: Record<string, RelevanceVerdict>
+  gateCalls?: string[]
   sinceLog?: Date[]
   meetings?: AmbientMeeting[]
   insights?: Record<string, AmbientInsight>
@@ -107,6 +110,10 @@ function fakeDeps(emails: InboundEmail[], options: FakeDepOptions = {}): ScanDep
     },
     listMeetings: async () => options.meetings ?? [],
     getMeetingInsight: async (_config, insightId) => options.insights?.[insightId] ?? { tldr: '', text: '' },
+    classifyEmail: async (_apiKey, email) => {
+      options.gateCalls?.push(email.messageId)
+      return options.gate?.[email.messageId] ?? { decision: 'unsure', confidence: 0.5, reason: 'test default' }
+    },
   }
 }
 
@@ -273,6 +280,7 @@ describe('scan route flow', () => {
       },
       listMeetings: async () => [],
       getMeetingInsight: async () => ({ tldr: '', text: '' }),
+      classifyEmail: async () => ({ decision: 'unsure', confidence: 0.5, reason: 'slow test' }),
     }
     const restore = setScanDepsForTesting(slowDeps)
     try {
@@ -503,6 +511,86 @@ describe('conversation merging & progress tracking', () => {
     const detail = (await api(app, owner, { method: 'GET', url: `/api/v1/leads/${hot.id}` })).json()
     expect(detail.stage).toBe('Qualified') // human-owned; only New leads auto-advance
     expect(detail.replySent).toBe(true)
+  })
+})
+
+describe('relevance gate + scan-window reliability', () => {
+  it('a confident-irrelevant gate verdict skips full scoring entirely', async () => {
+    const junk = email({
+      messageId: '<gate-junk-1@mail.example>',
+      from: { name: 'Deals Bot', address: 'promo@dealsbot.example' },
+      subject: '50% OFF EVERYTHING',
+      text: 'Unsubscribe here.',
+    })
+    const scoreCalls: Array<{ messageId: string }> = []
+    const gateCalls: string[] = []
+    const result = await runScan(app.prisma, testConfig(), owner.workspace.id, fakeDeps([junk], {
+      scoreCalls,
+      gateCalls,
+      gate: { [junk.messageId]: { decision: 'irrelevant', confidence: 0.95, reason: 'promotional blast' } },
+    }))
+    expect(result.ignored).toBe(1)
+    expect(gateCalls).toEqual([junk.messageId])
+    expect(scoreCalls).toHaveLength(0) // the expensive model never ran
+    const audit = await app.prisma.scannedMessage.findUnique({
+      where: { workspaceId_messageId: { workspaceId: owner.workspace.id, messageId: junk.messageId } },
+    })
+    expect(audit).toMatchObject({ status: 'skipped_irrelevant', decision: 'irrelevant', reason: 'promotional blast' })
+  })
+
+  it('a low-confidence irrelevant verdict escalates to the full scorer', async () => {
+    const maybe = email({
+      messageId: '<gate-maybe-1@mail.example>',
+      from: { name: 'Quinn Ro', address: 'quinn@maybe.example' },
+      subject: 'quick question',
+      text: 'Do you folks do trainings?',
+    })
+    scoredFor[maybe.messageId] = { ...scoredFor[hotEmail.messageId]!, summary: 'Asks about trainings.' }
+    const scoreCalls: Array<{ messageId: string }> = []
+    const result = await runScan(app.prisma, testConfig(), owner.workspace.id, fakeDeps([maybe], {
+      scoreCalls,
+      gate: { [maybe.messageId]: { decision: 'irrelevant', confidence: 0.4, reason: 'not sure' } },
+    }))
+    expect(scoreCalls).toHaveLength(1) // uncertainty is escalated, never discarded
+    expect(result.imported).toBe(1)
+    const audit = await app.prisma.scannedMessage.findUnique({
+      where: { workspaceId_messageId: { workspaceId: owner.workspace.id, messageId: maybe.messageId } },
+    })
+    expect(audit?.status).toBe('processed_lead')
+  })
+
+  it('a capped (partial) window advances the cursor only to the newest processed email', async () => {
+    const older = email({
+      messageId: '<window-1@mail.example>',
+      from: { name: 'Ada Voss', address: 'ada@window.example' },
+      subject: 'Workshop question',
+      date: new Date('2026-07-14T08:00:00Z'),
+      text: 'Interested in a workshop.',
+    })
+    scoredFor[older.messageId] = { ...scoredFor[hotEmail.messageId]!, summary: 'Workshop question.' }
+    // Pin the cursor before the email so the window math is deterministic.
+    const cred0 = await app.prisma.credential.findUniqueOrThrow({
+      where: { workspaceId_kind: { workspaceId: owner.workspace.id, kind: 'GMAIL_IMAP' } },
+    })
+    await app.prisma.credential.update({
+      where: { id: cred0.id },
+      data: { meta: { ...(cred0.meta as object), lastScanAt: '2026-07-14T00:00:00.000Z' } },
+    })
+    // Fetch returns exactly emailCap emails → the window was not fully read.
+    await runScan(app.prisma, testConfig(), owner.workspace.id, fakeDeps([older]), { emailCap: 1 })
+    const cred = await app.prisma.credential.findUniqueOrThrow({
+      where: { workspaceId_kind: { workspaceId: owner.workspace.id, kind: 'GMAIL_IMAP' } },
+    })
+    const cursor = new Date((cred.meta as { lastScanAt: string }).lastScanAt)
+    expect(cursor.toISOString()).toBe(older.date.toISOString()) // NOT "now" — the rest of the window survives
+
+    // An uncapped scan covers the whole window and advances to scan time.
+    const before = Date.now()
+    await runScan(app.prisma, testConfig(), owner.workspace.id, fakeDeps([]))
+    const cred2 = await app.prisma.credential.findUniqueOrThrow({
+      where: { workspaceId_kind: { workspaceId: owner.workspace.id, kind: 'GMAIL_IMAP' } },
+    })
+    expect(new Date((cred2.meta as { lastScanAt: string }).lastScanAt).getTime()).toBeGreaterThanOrEqual(before - 1000)
   })
 })
 

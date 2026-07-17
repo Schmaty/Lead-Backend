@@ -25,6 +25,7 @@ model Workspace {
   apiKeys     ApiKey[]
   auditLogs   AuditLog[]
   ignored     IgnoredThread[]
+  scanned     ScannedMessage[]
 }
 
 model User {
@@ -241,4 +242,28 @@ model IgnoredThread {
   at          DateTime  @default(now())
 
   @@unique([workspaceId, threadKey])
+}
+
+/// Per-email audit log: every message a scan touches ends up here with what
+/// happened to it (the scanner's core invariant — nothing silently disappears).
+model ScannedMessage {
+  id           String    @id @default(cuid())
+  workspaceId  String
+  workspace    Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  messageId    String
+  threadRootId String    @default("")
+  subject      String    @default("")
+  fromEmail    String    @default("")
+  receivedAt   DateTime
+  /// processed_lead | merged_existing_lead | skipped_irrelevant |
+  /// skipped_own_sent | skipped_duplicate | failed_relevance | failed_scoring
+  status       String
+  decision     String    @default("")
+  confidence   Float?
+  reason       String    @default("")
+  lastError    String    @default("")
+  processedAt  DateTime  @default(now()) @updatedAt
+
+  @@unique([workspaceId, messageId])
+  @@index([workspaceId, status])
 }
