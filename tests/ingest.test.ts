@@ -53,7 +53,8 @@ function ingest(payload: Record<string, unknown>, headers: Record<string, string
 }
 
 beforeAll(async () => {
-  app = await makeApp()
+  // The owner doubles as the platform developer — API keys are developer-only.
+  app = await makeApp({ DEVELOPER_EMAILS: 'owner@ingest.test' })
   await resetDb(app)
   owner = await signup(app, { email: 'owner@ingest.test', workspaceName: 'Ingest Co' })
   const keyRes = await api(app, owner, {
@@ -240,7 +241,7 @@ describe('HMAC signature (INGEST_HMAC_ENABLED)', () => {
   }
 
   beforeAll(async () => {
-    hmacApp = await makeApp({ INGEST_HMAC_ENABLED: 'true' })
+    hmacApp = await makeApp({ INGEST_HMAC_ENABLED: 'true', DEVELOPER_EMAILS: 'owner@ingest.test' })
   })
 
   afterAll(async () => {

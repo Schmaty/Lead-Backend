@@ -15,7 +15,7 @@ const COL_DEFS: Array<{ key: ColumnKey; label: string; width?: number; flex?: st
   { key: 'fit', label: 'Fit', width: 46, right: true },
   { key: 'urgency', label: 'Urg', width: 46, right: true },
   { key: 'lead', label: 'Lead', width: 56, right: true },
-  { key: 'ev', label: 'Expected', width: 98, right: true },
+  { key: 'ev', label: 'Est. value', width: 98, right: true },
   { key: 'stage', label: 'Stage', width: 154 },
   { key: 'owner', label: 'Owner', width: 128 },
   { key: 'follow_up', label: 'Follow-up', width: 104 },
@@ -159,6 +159,19 @@ export default function Leads(): ReactNode {
             />
           </label>
           <div style={{ flex: 1 }} />
+          {st.user!.role !== 'MEMBER' && (
+            <button
+              onClick={() => {
+                const n = st.selection.length
+                if (window.confirm(`Delete ${n} selected lead${n === 1 ? '' : 's'}? They disappear from every view.`)) {
+                  void desk.bulkDelete(st.selection)
+                }
+              }}
+              style={{ background: 'rgba(180,35,24,.85)', border: '1px solid rgba(255,255,255,.25)', color: '#fff', borderRadius: 7, padding: '6px 12px', fontSize: 12.5, fontWeight: 600, cursor: 'pointer' }}
+            >
+              Delete
+            </button>
+          )}
           <button onClick={() => set({ selection: [] })} style={{ background: 'transparent', border: '1px solid rgba(255,255,255,.3)', color: '#fff', borderRadius: 7, padding: '6px 12px', fontSize: 12.5, fontWeight: 600, cursor: 'pointer' }}>
             Clear
           </button>

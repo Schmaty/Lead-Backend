@@ -13,11 +13,12 @@ Self-hosted, multi-tenant lead desk: the **Leadline API** (reads your Gmail inbo
 
 - **Multi-tenant:** every business row belongs to a `Workspace`; every query is workspace-scoped. One deployment can serve multiple client businesses with isolated data.
 - **Self-contained pipeline:** the scanner, the AI scoring, and the database all live in this one service — no n8n, no Google Sheets, no external workflow tool. An optional [ingest webhook](#optional-push-leads-from-an-external-tool) exists for anything outside Leadline that wants to push leads in.
+- **Client-facing by design:** clients never touch API keys or OAuth apps. All platform secrets (the universal Anthropic key, the Google OAuth client) live behind the **developer account** — the allowlist in `DEVELOPER_EMAILS`, which shows a "Developer" title in the dashboard. Clients connect their inbox with one Google sign-in; the platform absorbs the AI bill.
 - **Portable by design:** Docker + config-only. Moving from the home server to a cloud VM later requires no code changes (see [Cloud migration](#cloud-migration-checklist)).
 
 **Stack:** Node.js 20 · TypeScript · Fastify 5 · Prisma 6 · PostgreSQL 16 · React 19 + Vite (dashboard) · Docker Compose · Caddy or Cloudflare Tunnel at the edge.
 
-**The dashboard** implements the full Lead Desk design: a Today briefing (morning brief, KPIs, needs-attention queue, funnel/source/score charts), a drag-and-drop Pipeline board, the All Leads table (filters, presets, search-in-URL, sorting, column toggles, density, bulk stage/owner/follow-up actions, CSV export), Analytics (win rate, calibration, weekly trends, source performance), a lead drawer (scores, reasons, deal economics with win-probability override, draft reply, email threads, notes, activity timeline, delete), and Settings (inbox scanning — Gmail + Anthropic credentials, scan-now, schedule — optional webhook ingest keys, tier cutoffs, win-probability map, stage rename/reorder/semantics, team + invites, sources, notification thresholds) — plus login, signup, invite-accept, forgot/reset password and change-password flows wired to the auth endpoints.
+**The dashboard** implements the full Lead Desk design: a Today briefing (morning brief, KPIs, needs-attention queue, funnel/source/score charts), a drag-and-drop Pipeline board, the All Leads table (filters, presets, search-in-URL, sorting, column toggles, density, bulk stage/owner/follow-up actions, CSV export), Analytics (win rate, calibration, weekly trends, source performance), a lead drawer (scores, reasons, deal economics with win-probability override, draft reply, email threads, notes, activity timeline, delete), and Settings (inbox scanning — connect Gmail by signing in, scan-now, schedule; developer-only platform keys + webhook ingest; tier cutoffs, win-probability map, stage rename/reorder/semantics, team + invites with a Developer title, sources, notification thresholds) — plus login, signup, invite-accept, forgot/reset password and change-password flows wired to the auth endpoints.
 
 ---
 
@@ -44,16 +45,21 @@ Base path: `/api/v1`. All responses are JSON in camelCase. This section is a sum
 | | `POST /api/v1/auth/password/change` · `…/password/reset-request` · `…/password/reset` | reset-request always returns 200 (no user enumeration) |
 | Workspace | `GET /api/v1/workspace` · `GET /workspace/users` | settings + members |
 | | `PATCH /api/v1/workspace/settings` | OWNER/ADMIN; changing `tierThresholds`/`winProbabilityMap` recomputes all leads |
-| | `GET/PUT/DELETE /api/v1/workspace/credentials[/:kind]` | OWNER/ADMIN; kinds: `ANTHROPIC_API_KEY`, `GMAIL_IMAP`, `N8N_WEBHOOK`; stored AES-256-GCM-encrypted, returned **masked only** |
-| | `GET/POST /api/v1/workspace/api-keys` · `DELETE /workspace/api-keys/:id` | OWNER/ADMIN; the full key is returned **exactly once** at creation |
-| Pipeline | `POST /api/v1/workspace/scan` | OWNER/ADMIN; kicks off an inbox scan in the background → `202 { started: true }` |
-| | `GET /api/v1/workspace/scan/status` | `{ configured, running, lastScanAt, pollMinutes, lastResult, lastError }` |
+| | `GET /api/v1/workspace/credentials` · `DELETE …/:kind` | OWNER/ADMIN (masked status + disconnect); `PUT …/:kind` is **developer-only** (kinds: `GMAIL_IMAP` fallback, `N8N_WEBHOOK`); values AES-256-GCM-encrypted, returned **masked only** |
+| | `GET/POST /api/v1/workspace/api-keys` · `DELETE /workspace/api-keys/:id` | **developer-only**; the full key is returned **exactly once** at creation |
+| Pipeline | `POST /api/v1/workspace/gmail/connect` | OWNER/ADMIN; returns the Google consent URL — clients connect their inbox by signing in |
+| | `GET /api/v1/auth/google/callback` | public (Google redirects here); stores the workspace's `GMAIL_OAUTH` refresh token, bounces back to Settings |
+| | `POST /api/v1/workspace/scan` | OWNER/ADMIN; kicks off an inbox scan in the background → `202 { started: true }` |
+| | `GET /api/v1/workspace/scan/status` | `{ configured, method, email, googleSignInAvailable, aiReady, running, progress, lastScanAt, pollMinutes, lastResult, lastError }` — `progress`/`lastResult` report live counts (imported, merged, replies, meetings, CRM matches, spam ignored) |
+| Platform | `GET/PUT/PATCH/DELETE /api/v1/platform/credentials[/:kind]` | **developer-only**; kinds: `ANTHROPIC_API_KEY` (universal AI key; `meta.model` picks the scoring model), `GOOGLE_OAUTH_CLIENT`, `AMBIENT_API_KEY` (meeting AI), `ZOHO_CRM` (read now — push coming soon). PATCH updates meta only (e.g. the model picker) |
 | Leads | `GET /api/v1/leads` | filters/sort/search/pagination + `aggregates` (see below) |
 | | `GET /api/v1/leads/export.csv` | same filters, CSV download |
 | | `GET /api/v1/leads/:id` | full record incl. `threads`, `timeline`, `timeInStageHours` |
 | | `POST /api/v1/leads` | manual add; computes tier/winProbability/expectedValue |
 | | `PATCH /api/v1/leads/:id` | **safe fields only** (see below) |
 | | `DELETE /api/v1/leads/:id` | OWNER/ADMIN; soft delete; audited |
+| | `GET /api/v1/leads/:id/crm` | matching Zoho CRM records for the lead + its people (read-only) |
+| | `POST /api/v1/leads/:id/crm/push` | **coming soon** — always `501 { comingSoon: true }` until a WRITE-scoped Zoho token ships |
 | Analytics | `GET /api/v1/analytics?from&to` | funnel, win rate, won value, weekly trends, first-response time, source performance, score calibration |
 | Ingest | `POST /api/v1/ingest/leads` | **`x-api-key` auth (not user auth)**; idempotent upsert by `externalId` |
 
@@ -103,7 +109,7 @@ Fill them into `.env`. Every variable is documented inline in [.env.example](.en
 
 | Layer | What | How |
 |---|---|---|
-| 1. Application | Integration secrets (`Credential` rows: Anthropic key, Gmail app password, webhook signing secret) | AES-256-GCM with `APP_ENCRYPTION_KEY`; API returns masked values only (`sk-…1234`) |
+| 1. Application | Integration secrets — platform (`PlatformCredential`: universal Anthropic key, Google OAuth client secret) and per-workspace (`Credential`: Google refresh token, app-password fallback, webhook signing secret) | AES-256-GCM with `APP_ENCRYPTION_KEY`; API returns masked values only (`sk-…1234`) |
 | 2. Disk | Everything in Postgres (incl. lead PII) | **Full-disk encryption (LUKS) on the host partition** holding `/var/lib/docker/volumes` — an operator step, since Postgres has no free built-in TDE. Easiest at OS install time (choose encrypted LVM); retrofitting: `cryptsetup luksFormat` on a dedicated data partition, then move the Docker data root onto it. |
 | 3. Backups | Nightly dumps | `pg_dump \| gzip \| gpg --symmetric` (AES-256) with `BACKUP_ENCRYPTION_KEY` |
 
@@ -206,29 +212,45 @@ Either way, the api and web containers are bound to `127.0.0.1` — the edge is 
 
 ## Built-in inbox scanning
 
-The pipeline is part of this service — no external workflow tool. On the schedule set in Settings (default every 15 minutes), the API connects to the workspace's Gmail inbox over IMAP, reads mail newer than the last scan, scores each message with the Anthropic API (`claude-opus-4-8`, structured outputs), and upserts leads straight into Postgres. Genuine inquiries land in **New**; newsletters/receipts/spam are filed to the **Spam** stage so nothing silently disappears. Mail sent from the workspace's own address is skipped, at most 25 emails are scored per scan, and the first scan looks back 7 days.
+The pipeline is part of this service — no external workflow tool. On the schedule set in Settings (default every 15 minutes), the API connects to the workspace's Gmail inbox over IMAP, reads mail newer than the last scan, scores each message with the Anthropic API (`claude-opus-4-8`, structured outputs), and upserts leads straight into Postgres. Genuine inquiries land in **New**; newsletters/receipts/spam **never enter the system** — they're recorded on an ignore list (the spam log) so future scans skip them without spending AI tokens. Mail sent from the workspace's own address is skipped, at most 25 emails are scored per scan, and the first scan looks back 7 days.
 
-**Connect it (Settings → Connection, as OWNER/ADMIN):**
+### What a client does (once)
 
-1. **Gmail app password** — the Gmail account needs 2-Step Verification on. Then: Google Account → **Security** → **2-Step Verification** → **App passwords** → create one (name it "Leadline"), and paste the 16-character password plus the Gmail address into the **Gmail mailbox** card. Your real Google password is never used or stored.
-2. **Anthropic API key** — create one at [console.anthropic.com](https://console.anthropic.com) and paste it into the **Anthropic API key** card.
-3. Hit **Scan now** to test; pick a schedule. Both secrets are AES-256-GCM-encrypted at rest and only ever shown masked.
+Settings → Connection → **Sign in with Google** with the account that receives inquiries. That's the whole setup: no keys, no app passwords, no billing. Then **Scan now** to test, and pick a schedule. Disconnecting is one click in the same place.
 
-Or via the API:
+### What the developer does (once per deployment)
+
+Sign in with an account whose email is in `DEVELOPER_EMAILS` (default: `kaz.keller20@gmail.com`) — it carries a **Developer** title in the dashboard, and Settings → Connection grows a Platform section:
+
+1. **Universal Anthropic key** — create one at [console.anthropic.com](https://console.anthropic.com) and store it in the Platform card (or `PUT /api/v1/platform/credentials/ANTHROPIC_API_KEY`). One key scores every workspace's mail; the platform absorbs the AI bill.
+2. **Google OAuth client** — in [Google Cloud Console](https://console.cloud.google.com): create a project → **APIs & Services → OAuth consent screen** (External) → **Credentials → Create credentials → OAuth client ID** (Web application) with authorized redirect URI `PUBLIC_URL/api/v1/auth/google/callback`. Store the client ID + secret in the Platform card. The flow requests the `https://mail.google.com/` scope (IMAP read access).
+   - **Verification caveat:** that scope is restricted, so an app left in "Testing" status only works for test users you list, and their refresh tokens expire after about 7 days. Publish the app — and complete Google's verification when you outgrow its unverified limits — before onboarding real clients. Check Google's current OAuth verification docs; these rules change.
+3. **App-password fallback** — for a mailbox that can't use sign-in, the developer can still store a Gmail app password per workspace (`PUT /api/v1/workspace/credentials/GMAIL_IMAP`, `meta: {email, host?, port?}` — any IMAP server works). Sign-in takes priority when both exist.
+
+Secrets are AES-256-GCM-encrypted at rest and only ever shown masked. Each workspace stores only its own Google **refresh token** (`GMAIL_OAUTH` credential); the scanner trades it for short-lived access tokens at scan time (IMAP XOAUTH2). Clients can check status and scan any time:
 
 ```bash
-curl -s -X PUT $API/api/v1/workspace/credentials/GMAIL_IMAP -H "authorization: Bearer $TOKEN" \
-  -H 'content-type: application/json' \
-  -d '{"value":"<16-char app password>","meta":{"email":"inbox@yourdomain.com"}}'
-curl -s -X PUT $API/api/v1/workspace/credentials/ANTHROPIC_API_KEY -H "authorization: Bearer $TOKEN" \
-  -H 'content-type: application/json' -d '{"value":"sk-ant-…"}'
 curl -s -X POST $API/api/v1/workspace/scan -H "authorization: Bearer $TOKEN"    # → 202
-curl -s $API/api/v1/workspace/scan/status -H "authorization: Bearer $TOKEN"    # → progress + last result
+curl -s $API/api/v1/workspace/scan/status -H "authorization: Bearer $TOKEN"    # → method, email, progress, last result
 ```
 
-Non-Gmail mailboxes work too: any IMAP server can be used by adding `"host"` and `"port"` to the `GMAIL_IMAP` credential's `meta`.
+### Conversations merge into one lead
 
-Re-scans are idempotent — a lead is keyed by the email's Message-ID, so re-reading the same mail updates the AI fields but never duplicates, and the fields humans own (stage, owner, follow-up, notes, a win-probability override) always survive.
+A lead is a **conversation**, not a single email. Messages thread together by their `References`/`In-Reply-To` headers (with a sender + "Re:"-subject fallback for clients that drop them), so when a prospect replies, the new email **merges into the same lead**: the message joins the lead's email thread, an `email_received` event lands on its timeline, and Claude re-assesses the deal *with the full exchange as context* — summary, scores, deal value, next step, and the draft reply all reflect where the conversation now stands. First-contact date and everything humans own (stage, owner, follow-up, notes, a win-probability override) are never touched by a merge.
+
+Your side of the conversation is tracked too: each scan also reads the account's **sent mail** and attaches your replies to the matching lead — the reply appears in the thread (outbound), `replySent` flips on, a `reply_sent` event hits the timeline, and a lead still sitting in the first stage auto-advances to the contacted stage (leads a human has already moved are left alone).
+
+Re-scans are idempotent — conversations are keyed by their thread root, already-seen messages are recognized (and spend no AI calls), nothing ever duplicates.
+
+### People, meetings, and the CRM
+
+Every lead keeps a **people profile**: whoever reached out, every extra correspondent that joins the thread, and everyone who sat in a matched meeting — with contact info, first/last-seen, and their messages attached (each email thread entry links to its person). The scanner maintains this automatically.
+
+With the **Ambient meeting AI** connected (developer: Settings → Platform), each scan also matches recent meetings to leads by attendee email: the meeting lands on the lead with its AI dossier + tldr and a link back to Ambient, attendees join the people profile, a `meeting` event hits the timeline — and the next re-score reads the meeting intel as context.
+
+With **Zoho CRM** connected, every scan (Scan now and scheduled) also **pulls the CRM automatically**: matches for each lead's people are cached on the lead, logged on its timeline (`crm_match`), and used to backfill the org and person phone numbers — the drawer shows them instantly with deep links. Only **pushing** leads *to* Zoho is gated "coming soon" (the current platform token carries read-only scopes; it ships once a WRITE-scoped token is connected).
+
+The developer Platform card also carries a **scoring-model picker** (Opus 4.8 default, Sonnet 5, Sonnet 4.6, Haiku 4.5) — switch what Claude model scores mail without touching the key.
 
 ## Optional: push leads from an external tool
 
@@ -372,7 +394,7 @@ npm run dev         # http://localhost:5173 — proxies /api to 127.0.0.1:8080
 npm run build       # typecheck + production bundle
 ```
 
-Tests cover auth (signup/login/refresh rotation/reuse detection/invites/roles/password change+reset), workspace isolation, lead CRUD, every list filter, aggregates, sorting, pagination, CSV, analytics, safe-field enforcement, credential encryption/masking, ingest (key auth, idempotent upsert, human-field preservation, HMAC), and the inbox-scanning pipeline (configuration gating, role checks, idempotent re-scans, spam routing, scan-cursor overlap, per-email error isolation — with the IMAP fetch and Claude scoring stubbed out).
+Tests cover auth (signup/login/refresh rotation/reuse detection/invites/roles/password change+reset), workspace isolation, lead CRUD, every list filter, aggregates, sorting, pagination, CSV, analytics, safe-field enforcement, credential encryption/masking, ingest (key auth, idempotent upsert, human-field preservation, HMAC), the inbox-scanning pipeline (configuration gating, role checks, idempotent re-scans, spam routing, scan-cursor overlap, per-email error isolation — with the IMAP fetch and Claude scoring stubbed out), and the platform tier (developer allowlist gating, platform credential encryption, the Google connect/callback flow with stubbed token exchange, OAuth-based scanning, client lockdown of keys).
 
 ## Design decisions & defaults
 

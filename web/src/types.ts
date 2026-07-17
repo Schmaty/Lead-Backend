@@ -5,6 +5,7 @@ export interface UserInfo {
   name: string
   email: string
   role: Role
+  developer?: boolean
   lastLoginAt: string | null
 }
 
@@ -34,6 +35,46 @@ export interface Thread {
   direction: 'in' | 'out'
   date: string
   snippet: string
+  personId?: string | null
+}
+
+export interface Person {
+  id: string
+  name: string
+  email: string
+  role: string
+  phone: string
+  notes: string
+  firstSeenAt: string
+  lastSeenAt: string
+}
+
+export interface Meeting {
+  id: string
+  title: string
+  startsAt: string
+  endsAt: string | null
+  attendees: Array<{ name: string; email: string; organizer: boolean }>
+  tldr: string
+  dossier: string
+  url: string
+}
+
+export interface CrmRecord {
+  module: 'Leads' | 'Contacts'
+  id: string
+  name: string
+  company: string
+  email: string
+  phone: string
+  url: string
+}
+
+export interface CrmLookup {
+  available: boolean
+  records: CrmRecord[]
+  checkedAt: string | null
+  push: { comingSoon: boolean }
 }
 
 export interface TimelineEvent {
@@ -80,6 +121,10 @@ export interface Lead {
   createdAt: string
   updatedAt: string
   threads?: Thread[]
+  people?: Person[]
+  meetings?: Meeting[]
+  crmRecords?: CrmRecord[]
+  crmCheckedAt?: string | null
   timeline?: TimelineEvent[]
   timeInStageHours?: number
 }
@@ -109,6 +154,8 @@ export interface SessionUser {
   name: string
   email: string
   role: Role
+  /** True for the allowlisted platform developer account. */
+  developer?: boolean
   lastLoginAt: string | null
   createdAt: string
 }
@@ -220,14 +267,44 @@ export interface ScanResult {
   at: string
   scanned: number
   imported: number
+  /** New emails merged into existing leads' conversations. */
+  merged: number
   updated: number
   skipped: number
+  /** Outbound replies detected in sent mail and attached to leads. */
+  replies: number
+  /** Meetings newly attached to leads by the transcript provider. */
+  meetings: number
+  /** Irrelevant conversations remembered and kept out of the system. */
+  ignored: number
+  /** Leads that gained new CRM matches in the Zoho pull. */
+  crm: number
   errors: string[]
+}
+
+export interface ScanProgress {
+  phase: 'connecting' | 'scoring' | 'replies' | 'meetings' | 'crm'
+  /** Conversations to score, not raw emails. */
+  total: number
+  processed: number
+  imported: number
+  merged: number
+  updated: number
+  skipped: number
+  ignored: number
+  replies: number
+  meetings: number
+  crm: number
 }
 
 export interface ScanStatus {
   configured: boolean
+  method: 'oauth' | 'imap' | null
+  email: string | null
+  googleSignInAvailable: boolean
+  aiReady: boolean
   running: boolean
+  progress: ScanProgress | null
   lastScanAt: string | null
   pollMinutes: number
   lastResult: ScanResult | null

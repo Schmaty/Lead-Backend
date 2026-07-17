@@ -1,7 +1,13 @@
 import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify'
 import type { Role } from '@prisma/client'
 import { verifyAccessToken } from '../auth/tokens.js'
+import type { AppConfig } from '../config.js'
 import { AppError } from './errorHandler.js'
+
+/** True when the email is on the platform developer allowlist (DEVELOPER_EMAILS). */
+export function isDeveloper(config: AppConfig, email: string): boolean {
+  return config.developerEmails.includes(email.toLowerCase())
+}
 
 /**
  * preHandler: requires a valid Bearer access token and loads the current user.
@@ -39,6 +45,21 @@ export function requireRole(...roles: Role[]) {
     if (!request.auth) throw new AppError(401, 'Missing access token')
     if (!roles.includes(request.auth.role)) {
       throw new AppError(403, `Requires role: ${roles.join(' or ')}`)
+    }
+  }
+}
+
+/**
+ * preHandler: requires the allowlisted developer account. Must run after
+ * authGuard. Platform credentials, ingest API keys, and raw workspace secrets
+ * are developer territory — clients connect integrations by signing in, not
+ * by pasting keys.
+ */
+export function requireDeveloper(app: FastifyInstance) {
+  return async function (request: FastifyRequest, _reply: FastifyReply): Promise<void> {
+    if (!request.auth) throw new AppError(401, 'Missing access token')
+    if (!isDeveloper(app.config, request.auth.email)) {
+      throw new AppError(403, 'Requires the developer account')
     }
   }
 }

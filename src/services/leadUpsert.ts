@@ -38,20 +38,40 @@ export interface UpsertLeadInput {
   createdDetail: string
 }
 
+export interface UpsertOptions {
+  /**
+   * How `input.threads` combines with what's stored:
+   * - 'replace' (webhook): the payload is the authoritative set — swap it in.
+   * - 'merge' (scanner): the payload is the newly seen messages — append the
+   *   ones not already stored (by url), keep the rest, log `email_received`
+   *   timeline events for new inbound messages, and preserve `receivedAt`
+   *   (first contact) while bumping `lastTouchedAt` to the newest message.
+   */
+  threadMode?: 'replace' | 'merge'
+}
+
+export interface UpsertOutcome {
+  lead: Lead
+  created: boolean
+  /** How many messages from input.threads were actually new (merge mode). */
+  addedThreads: number
+}
+
 /**
  * Idempotent upsert by (workspaceId, externalId): re-runs update the AI-owned
- * fields and replace threads; human-owned fields (stage, owner, follow-up,
- * notes, replySent, a manual winProbability override) survive re-ingestion.
- * Shared by the ingest webhook and the built-in inbox scanner.
+ * fields; human-owned fields (stage, owner, follow-up, notes, replySent, a
+ * manual winProbability override) survive re-ingestion. Shared by the ingest
+ * webhook (thread replace) and the built-in inbox scanner (thread merge).
  */
 export async function upsertLeadByExternalId(
   prisma: PrismaClient,
   workspaceId: string,
   settings: WorkspaceSettings,
   input: UpsertLeadInput,
-): Promise<{ lead: Lead; created: boolean }> {
+  options: UpsertOptions = {},
+): Promise<UpsertOutcome> {
+  const threadMode = options.threadMode ?? 'replace'
   const aiFields = {
-    receivedAt: input.receivedAt,
     name: input.name,
     email: input.email,
     org: input.org,
@@ -78,11 +98,16 @@ export async function upsertLeadByExternalId(
     date: thread.date,
     snippet: thread.snippet,
   }))
+  const newestThreadAt = threadRows.reduce(
+    (max, row) => (row.date > max ? row.date : max),
+    input.receivedAt,
+  )
 
   const upsertOnce = () =>
     prisma.$transaction(async (tx) => {
       const existing = await tx.lead.findUnique({
         where: { workspaceId_externalId: { workspaceId, externalId: input.externalId } },
+        include: { threads: { select: { url: true } } },
       })
       if (!existing) {
         const computed = applyComputed(input, settings)
@@ -90,18 +115,20 @@ export async function upsertLeadByExternalId(
           data: {
             workspaceId,
             externalId: input.externalId,
+            receivedAt: input.receivedAt,
             ...aiFields,
             ...computed,
             stage: input.initialStage,
-            lastTouchedAt: input.receivedAt,
+            lastTouchedAt: newestThreadAt,
             threads: { create: threadRows },
             timeline: {
               create: { type: 'created', actor: 'system', detail: input.createdDetail },
             },
           },
         })
-        return { lead, created: true }
+        return { lead, created: true, addedThreads: threadRows.length }
       }
+
       const computed = applyComputed(
         {
           leadScore: input.leadScore,
@@ -112,15 +139,47 @@ export async function upsertLeadByExternalId(
         },
         settings,
       )
+
+      let addedThreads = 0
+      if (threadMode === 'merge') {
+        const known = new Set(existing.threads.map((t) => t.url))
+        const fresh = threadRows.filter((row) => !known.has(row.url))
+        addedThreads = fresh.length
+        if (fresh.length > 0) {
+          await tx.thread.createMany({ data: fresh.map((row) => ({ ...row, leadId: existing.id })) })
+          await tx.timelineEvent.createMany({
+            data: fresh
+              .filter((row) => row.direction === 'in')
+              .map((row) => ({
+                leadId: existing.id,
+                type: 'email_received',
+                actor: 'system',
+                detail: `New email in thread: "${row.subject}"`,
+                at: row.date,
+              })),
+          })
+        }
+      } else {
+        await tx.thread.deleteMany({ where: { leadId: existing.id } })
+        if (threadRows.length > 0) {
+          await tx.thread.createMany({ data: threadRows.map((row) => ({ ...row, leadId: existing.id })) })
+        }
+        addedThreads = threadRows.length
+      }
+
       const lead = await tx.lead.update({
         where: { id: existing.id },
-        data: { ...aiFields, ...computed },
+        data: {
+          ...aiFields,
+          ...computed,
+          // Replace mode: the sender owns receivedAt. Merge mode: first contact stays.
+          ...(threadMode === 'replace' ? { receivedAt: input.receivedAt } : {}),
+          ...(threadMode === 'merge' && addedThreads > 0 && newestThreadAt > existing.lastTouchedAt
+            ? { lastTouchedAt: newestThreadAt }
+            : {}),
+        },
       })
-      await tx.thread.deleteMany({ where: { leadId: existing.id } })
-      if (threadRows.length > 0) {
-        await tx.thread.createMany({ data: threadRows.map((row) => ({ ...row, leadId: existing.id })) })
-      }
-      return { lead, created: false }
+      return { lead, created: false, addedThreads }
     })
 
   try {

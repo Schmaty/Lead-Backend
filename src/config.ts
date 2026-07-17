@@ -28,6 +28,10 @@ export interface AppConfig {
   smtpUrl: string | undefined
   smtpFrom: string
   logLevel: string
+  /** Emails allowed to manage platform credentials and API keys (lowercased). */
+  developerEmails: string[]
+  /** Public origin of the deployment — used for OAuth redirect URIs and post-connect redirects. */
+  publicUrl: string
 }
 
 const DURATION_RE = /^(\d+)\s*(s|m|h|d)$/i
@@ -71,6 +75,8 @@ const envSchema = z.object({
   SMTP_URL: z.string().optional(),
   SMTP_FROM: z.string().default('Leadline <no-reply@localhost>'),
   LOG_LEVEL: z.enum(['fatal', 'error', 'warn', 'info', 'debug', 'trace', 'silent']).default('info'),
+  DEVELOPER_EMAILS: z.string().default('kaz.keller20@gmail.com'),
+  PUBLIC_URL: z.string().optional(),
 })
 
 /**
@@ -151,5 +157,9 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     smtpUrl: raw.SMTP_URL || undefined,
     smtpFrom: raw.SMTP_FROM,
     logLevel: raw.LOG_LEVEL,
+    developerEmails: raw.DEVELOPER_EMAILS.split(',')
+      .map((email) => email.trim().toLowerCase())
+      .filter(Boolean),
+    publicUrl: (raw.PUBLIC_URL || corsOrigins[0] || 'http://localhost:5173').replace(/\/$/, ''),
   }
 }

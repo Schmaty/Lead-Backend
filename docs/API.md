@@ -56,10 +56,11 @@ async function apiFetch<T>(path: string, init: RequestInit = {}, retry = true): 
 | Role | Can do |
 |---|---|
 | `MEMBER` | Everything on leads (list/read/create/patch) + analytics + read workspace/users |
-| `ADMIN` | MEMBER + invite users, manage credentials, manage API keys, edit settings, delete leads |
+| `ADMIN` | MEMBER + invite users, connect/disconnect the inbox, edit settings, delete leads, read credential status |
 | `OWNER` | ADMIN (one per workspace, created by signup) |
+| **Developer** | not a workspace role — a platform-wide allowlist (`DEVELOPER_EMAILS`). Only these accounts manage platform credentials, raw workspace secrets, and ingest API keys (§7). Flagged as `developer: true` on user payloads. |
 
-Calls that exceed the caller's role return `403 { "error": "Requires role: OWNER or ADMIN" }`.
+Calls that exceed the caller's role return `403 { "error": "Requires role: OWNER or ADMIN" }`; developer-only calls return `403 { "error": "Requires the developer account" }`.
 
 ### Error contract (all endpoints)
 
@@ -102,7 +103,7 @@ No body; needs the cookie (`credentials: 'include'`). → `200 { accessToken, us
 No body; needs the cookie. Revokes the refresh token, clears the cookie. Always `200 { ok: true }`.
 
 ### `GET /auth/me` (Bearer)
-→ `{ user: { id, name, email, role, lastLoginAt, createdAt }, workspace: { id, name, slug, settings } }`. Call this on app boot (after a silent refresh) to hydrate session + settings in one round trip.
+→ `{ user: { id, name, email, role, developer, lastLoginAt, createdAt }, workspace: { id, name, slug, settings } }`. Call this on app boot (after a silent refresh) to hydrate session + settings in one round trip. `developer` is true only for allowlisted platform-developer accounts — the dashboard uses it to reveal the Platform section and show the "Developer" title.
 
 ### `POST /auth/invite` (Bearer, OWNER/ADMIN)
 Body: `{ email, role: "ADMIN" | "MEMBER" }` → `{ inviteUrl, token, emailed, expiresInSec }`.
@@ -131,7 +132,7 @@ Returned by every lead endpoint. Fields marked ⚙ are computed server-side; ✍
 ```ts
 interface Lead {
   id: string
-  externalId: string | null      // email Message-ID / external id (null for manually added leads)
+  externalId: string | null      // conversation thread-root Message-ID / external id (null for manual leads)
   receivedAt: string             // ISO date the inquiry arrived
   name: string; email: string; org: string
   source: string                 // e.g. "Website form" | "Email" | "Referral" | "Event" | "Other"
@@ -163,7 +164,7 @@ interface Lead {
 }
 ```
 
-Timeline event `type` values: `created`, `stage_change`, `owner_change`, `follow_up_set`, `note_added`, `reply_sent`, `win_probability_set`. `actor` is a user's display name or `"system"` (inbox scanner / ingest webhook).
+Timeline event `type` values: `created`, `stage_change`, `owner_change`, `follow_up_set`, `note_added`, `email_received`, `reply_sent`, `meeting`, `crm_match`, `win_probability_set`. `actor` is a user's display name or `"system"` (inbox scanner / ingest webhook). The scanner writes `email_received` when a new inbound message merges into an existing conversation, and `reply_sent` / `stage_change` (actor `system`) when it notices one of your own replies in sent mail.
 
 ### Computed-field semantics
 
@@ -265,6 +266,21 @@ Soft delete — the lead disappears from every list/detail/aggregate/analytics q
 
 ---
 
+### `GET /leads/:id/crm` — Zoho CRM matches (read-only)
+Runs the same CRM pull the scan runs (results cache on the lead as `crmRecords`/`crmCheckedAt`; new matches log `crm_match`; org + person phones backfill). → `{ available, records: [{ module, id, name, company, email, phone, url }], checkedAt, push: { comingSoon: true } }`. The dashboard shows cached matches instantly and uses this endpoint as a refresh. `available: false` (empty records) until the developer stores the `ZOHO_CRM` platform credential; `502` if Zoho rejects the lookup. `url` deep-links into the Zoho UI.
+
+### `POST /leads/:id/crm/push` — coming soon
+Always `501 { "error": "Pushing to Zoho CRM is coming soon", "comingSoon": true }`. The feature is built but gated: current platform tokens are read-only; it ships once a WRITE-scoped Zoho token is connected. Frontends should render the button disabled with a "Coming soon" tag.
+
+### People & meetings on the lead detail
+
+`GET /leads/:id` also returns:
+
+- `people: [{ id, name, email, role, phone, notes, firstSeenAt, lastSeenAt }]` — everyone connected to the lead: the original sender (role `"Reached out"`), later correspondents in the thread, and meeting attendees (role `"Meeting attendee"`). Auto-maintained by the scanner; names/roles are never overwritten once set. Each `threads[]` entry carries `personId` linking the message to its person.
+- `meetings: [{ id, title, startsAt, endsAt, attendees, tldr, dossier, url }]` — meetings matched to this lead by attendee email from the connected meeting-AI provider (ambient.us), with the AI dossier text, its tldr, and a deep link. Each lands once (idempotent), adds a `meeting` timeline event, and feeds the next conversation re-score as context.
+
+---
+
 ## 6. Analytics (`GET /api/v1/analytics`, Bearer)
 
 Query: `from`, `to` (ISO dates; default = the last 90 days). The window filters on `receivedAt`. Soft-deleted leads are excluded. Everything is computed per-workspace.
@@ -328,36 +344,77 @@ Send any subset of:
 
 → `{ settings, recomputedLeads, renamedStages }` (`recomputedLeads` = how many leads changed). Unknown keys → 400. Audited.
 
-### Credentials (OWNER/ADMIN) — integration secrets, encrypted at rest
+### The developer account (platform tier)
 
-| Kind | `value` (encrypted) | `meta` (plain JSON) | Used for |
+Emails on the `DEVELOPER_EMAILS` allowlist (env, default `kaz.keller20@gmail.com`) are **developer accounts** — they carry `developer: true` on every user payload and a "Developer" title in the dashboard. Everything key-shaped is locked to them: platform credentials (below), raw workspace secrets (`PUT /workspace/credentials/:kind`), and ingest API keys. Clients never handle keys; they connect their inbox by signing in with Google.
+
+#### Platform credentials (`/api/v1/platform`, developer-only)
+
+Universal secrets shared by every workspace:
+
+| Kind | `value` (encrypted) | `meta` | Used for |
 |---|---|---|---|
-| `GMAIL_IMAP` | the Gmail **app password** (Google Account → Security → 2-Step Verification → App passwords) | `{ email, host?, port?, lastScanAt? }` — `email` is required; `host`/`port` default to `imap.gmail.com:993`; `lastScanAt` is maintained by the scanner | the inbox the built-in scanner reads |
-| `ANTHROPIC_API_KEY` | an Anthropic API key | — | scoring each scanned email with Claude |
-| `N8N_WEBHOOK` | a shared signing secret | — | optional HMAC verification on the ingest webhook (§8) |
+| `ANTHROPIC_API_KEY` | the one Anthropic key that scores all workspaces' mail (the platform absorbs the bill) | `{ model? }` — the scoring model; one of `claude-opus-4-8` (default) · `claude-sonnet-5` · `claude-sonnet-4-6` · `claude-haiku-4-5` | AI scoring + model picker |
+| `GOOGLE_OAUTH_CLIENT` | the OAuth client **secret** | `{ clientId }` (required) | the Google app clients sign in through; redirect URI is `PUBLIC_URL/api/v1/auth/google/callback` |
+| `AMBIENT_API_KEY` | the ambient.us API key | `{ baseUrl? }` (default `https://api.ambient.us/v1`) | meeting-dossier enrichment: matched meetings land on leads, attendees join people profiles |
+| `ZOHO_CRM` | JSON `{"clientSecret","refreshToken"}` | `{ clientId }` (required), `accountsUrl?`, `apiDomain?` | read-only CRM lookups on each lead. **Push is coming soon** — needs a WRITE-scoped token |
 
 | Call | Body | Returns |
 |---|---|---|
-| `GET /workspace/credentials` | — | `{ credentials: [{ kind, maskedValue, meta, createdAt, updatedAt }] }` |
-| `PUT /workspace/credentials/:kind` | `{ value, meta? }` | `{ kind, maskedValue, meta, updatedAt }` — upsert = rotation |
-| `DELETE /workspace/credentials/:kind` | — | `{ ok: true }` (404 if absent) |
+| `GET /platform/credentials` | — | `{ credentials: [{ kind, maskedValue, meta, createdAt, updatedAt }] }` |
+| `PUT /platform/credentials/:kind` | `{ value, meta? }` | masked row — upsert = rotation. `400` on invalid meta (missing `clientId`, unknown `model`) |
+| `PATCH /platform/credentials/:kind` | `{ meta }` | merge-updates meta **without re-pasting the secret** — how the model picker saves. `404` until the secret exists |
+| `DELETE /platform/credentials/:kind` | — | `{ ok: true }` (404 if absent) |
 
-**The raw secret is never returned by any endpoint** — only masked (`sk-…0042`). Values are AES-256-GCM-encrypted in the database. The frontend should treat these as write-only: show the mask, offer "replace" and "delete".
+Non-developers get `403 { "error": "Requires the developer account" }` on all three.
+
+### Workspace credentials — connection state, encrypted at rest
+
+| Kind | Set by | `value` (encrypted) | `meta` |
+|---|---|---|---|
+| `GMAIL_OAUTH` | the **Google sign-in flow** (never PUT directly) | the workspace's Google refresh token | `{ email, lastScanAt? }` |
+| `GMAIL_IMAP` | developer PUT (fallback for mailboxes that can't use sign-in) | a Gmail/IMAP **app password** | `{ email, host?, port?, lastScanAt? }` — `host`/`port` default to `imap.gmail.com:993` |
+| `N8N_WEBHOOK` | developer PUT | a shared signing secret for ingest HMAC (§8) | — |
+
+| Call | Who | Returns |
+|---|---|---|
+| `GET /workspace/credentials` | OWNER/ADMIN | masked rows — how the dashboard shows connection state |
+| `PUT /workspace/credentials/:kind` | **developer only** | masked row (kinds: `GMAIL_IMAP`, `N8N_WEBHOOK`) |
+| `DELETE /workspace/credentials/:kind` | OWNER/ADMIN | `{ ok: true }` — disconnecting (incl. `GMAIL_OAUTH`) is a client action |
+
+**The raw secret is never returned by any endpoint** — only masked (`sk-…0042`). Values are AES-256-GCM-encrypted in the database.
+
+### Connecting Gmail (the client sign-in flow)
+
+1. `POST /workspace/gmail/connect` (OWNER/ADMIN) → `{ url }`, the Google consent URL (scope `https://mail.google.com/` for IMAP read access; state = signed 10-minute token binding the flow to this workspace). `400` until the developer stores `GOOGLE_OAUTH_CLIENT`.
+2. The frontend navigates to `url`; the client signs in with the inbox that receives inquiries.
+3. Google redirects to `GET /api/v1/auth/google/callback` (public), which verifies the state, exchanges the code, stores the refresh token as the `GMAIL_OAUTH` credential, and 302-redirects to `PUBLIC_URL/#/settings?gmail=connected` (or `?gmail=error`). Reconnecting the same mailbox keeps its scan cursor.
 
 ### Inbox scanning (the built-in pipeline)
 
-Once `GMAIL_IMAP` **and** `ANTHROPIC_API_KEY` are stored, the server polls the mailbox on the `scanSettings.pollMinutes` cadence: it fetches mail newer than the last scan over IMAP, scores each email with the Anthropic API (`claude-opus-4-8`, structured outputs — category, 0–10 fit/urgency/lead scores, deal-value estimate, next step, draft reply), and upserts a lead per email. The email's Message-ID is the `externalId`, so re-scans update rather than duplicate and human edits survive (§8 semantics). Irrelevant mail (newsletters, receipts, spam) is filed to the stage matching `/spam/i` — or dropped if no such stage exists; mail from the workspace's own address is skipped; at most 25 emails are scored per scan; the first scan looks back 7 days.
+Once a mailbox is connected (`GMAIL_OAUTH`, or the `GMAIL_IMAP` fallback) **and** the platform Anthropic key exists, the server polls the mailbox on the `scanSettings.pollMinutes` cadence: it fetches mail newer than the last scan over IMAP (OAuth connections trade the refresh token for a short-lived XOAUTH2 access token per scan), groups it into **conversations** by `References`/`In-Reply-To` (falling back to sender + normalized "Re:" subject when those headers are missing), and scores each conversation with the Anthropic API (`claude-opus-4-8`, structured outputs — category, 0–10 fit/urgency/lead scores, deal-value estimate, next step, draft reply). The conversation's thread-root Message-ID is the lead's `externalId`:
+
+- A **new conversation** creates a lead (several same-thread messages in one scan still make one lead and one AI call).
+- A **reply to a known conversation** merges into its lead: the message is appended to the lead's threads, an `email_received` timeline event is written, and the re-score runs **with the prior exchange + previous summary as context** so the assessment reflects where the deal now stands. `receivedAt` (first contact) and all human-owned fields survive (§8 semantics).
+- **Already-seen messages** (the overlap window re-reads ~1h of history) are recognized by message identity and spend **no** AI calls.
+- **Cheap relevance gate:** new conversations first pass a fast Haiku classifier (`{decision, confidence, reason}`). Confident-irrelevant mail (newsletters, receipts, notifications, vendor pitches, spam) is filed to the ignore list without ever reaching the expensive scorer; anything relevant, unsure, or low-confidence **escalates** to full scoring — uncertainty is never discarded.
+- **Window coverage guarantee:** `lastScanAt` means "everything up to here is processed". Emails are read oldest-first; if a scan hits its per-run cap (100), the cursor advances only to the newest processed email so the remainder is picked up next scan — never skipped. The cursor never moves backward.
+- **Audit log:** every scanned message gets a `ScannedMessage` row (status: `processed_lead`, `merged_existing_lead`, `skipped_irrelevant`, `skipped_own_sent`, `skipped_duplicate`, `failed_relevance`, `failed_scoring` — with gate decision/confidence/reason and last error). Failures aren't ignored-listed, so the next scan's overlap retries them.
+
+When Zoho is connected, a **CRM pull pass** also runs every scan: leads touched this scan (plus up to 10 never-checked leads) are searched in Zoho by their people's emails; matches are cached on the lead (`crmRecords`, `crmCheckedAt`), new ones logged as `crm_match` timeline events, and the CRM's company/phone backfill empty fields — read-only toward Zoho. After the inbox pass, the scanner reads the account's **sent-mail folder** (found via the special-use `\Sent` flag) and attaches your own replies to the leads they answer: outbound thread entry, `replySent: true`, a `reply_sent` timeline event, and — only for leads still in the first pipeline stage — an automatic advance to the stage matching `/contact/i` with a `stage_change` event (actor `system`). Leads a human has moved are never touched.
+
+Irrelevant mail (newsletters, receipts, spam) **never becomes a lead**: the conversation is recorded in the `IgnoredThread` table (the spam log) and every future scan skips it before any AI call; mail from the workspace's own address is skipped in the inbox pass; at most 25 inbound emails (and 50 sent) are read per scan; the first scan looks back 7 days. A legacy per-workspace `ANTHROPIC_API_KEY` credential still works as an AI-key fallback for pre-platform installs.
 
 | Call | Role | Returns |
 |---|---|---|
-| `POST /workspace/scan` | OWNER/ADMIN | `202 { started: true }` — the scan runs in the background. `400` if the two credentials aren't stored, `409` if a scan is already running. Audited. |
-| `GET /workspace/scan/status` | any | `{ configured, running, lastScanAt, pollMinutes, lastResult, lastError }` where `lastResult` = `{ at, scanned, imported, updated, skipped, errors: string[] }` |
+| `POST /workspace/scan` | OWNER/ADMIN | `202 { started: true }` — the scan runs in the background. `400` if not configured, `409` if a scan is already running. Audited. |
+| `GET /workspace/scan/status` | any | `{ configured, method: "oauth"\|"imap"\|null, email, googleSignInAvailable, aiReady, running, progress, lastScanAt, pollMinutes, lastResult, lastError }` where `progress` (non-null only while running) = `{ phase: "connecting"\|"scoring"\|"replies"\|"meetings"\|"crm", total, processed, imported, merged, updated, skipped, ignored, replies, meetings, crm }` (`total` counts conversations, not raw emails) and `lastResult` = `{ at, scanned, imported, merged, updated, skipped, ignored, replies, meetings, crm, errors: string[] }` |
 
-Frontend flow for a "Scan now" button: POST, then poll status every ~2 s until `running` is false, then show `lastResult`/`lastError` and refresh the lead list.
+Status drives the whole Settings UI: `email` null → show "Sign in with Google" (disabled with a call-your-developer note when `googleSignInAvailable` is false); `email` set → show the connected mailbox + Disconnect; `aiReady` false → the developer hasn't stored the platform key yet. Frontend flow for "Scan now": POST, poll status every ~2 s rendering `progress` ("Scoring conversation 3 of 12…", then "Checking sent mail…") until `running` is false, then show `lastResult`/`lastError` and refresh the lead list.
 
-### API keys (OWNER/ADMIN) — for external tools → ingest auth (optional)
+### API keys (developer-only) — for external tools → ingest auth (optional)
 
-Not needed for inbox scanning — only for something outside Leadline pushing leads to §8.
+Not needed for inbox scanning — only for something outside Leadline pushing leads to §8. Locked to the developer account (a plain OWNER/ADMIN gets 403).
 
 | Call | Body | Returns |
 |---|---|---|
@@ -385,7 +442,7 @@ Payload (unknown extra fields are ignored):
 | `fitScore`, `urgencyScore`, `leadScore` | int 0–10 | ✔ | |
 | `dealValueLow`, `dealValueHigh` | number ≥ 0 | — | default 0 |
 | `fitReasons`, `riskFlags`, `inferredFields` | string[] | — | default `[]` |
-| `threads` | `[{ subject, url, direction: "in"\|"out", date, snippet }]` | — | replaces the stored set on every ingest |
+| `threads` | `[{ subject, url, direction: "in"\|"out", date, snippet }]` | — | replaces the stored set on every ingest (the webhook payload is authoritative; only the built-in scanner uses merge semantics) |
 
 Responses: `201 { id, created: true }` on first sight of an `externalId`; `200 { id, created: false }` on any re-run (the row is **updated, never duplicated** — sender retries are safe).
 
@@ -408,7 +465,11 @@ Responses: `201 { id, created: true }` on first sight of an `externalId`; `200 {
 | `updateSettings(patch)` | `PATCH /workspace/settings` |
 | analytics page | `GET /analytics?from&to` |
 | team management | `GET /workspace/users` · `POST /auth/invite` · `POST /auth/accept-invite` |
-| integrations page | `GET/PUT/DELETE /workspace/credentials/:kind` · `GET/POST/DELETE /workspace/api-keys` |
+| connect Gmail (client) | `POST /workspace/gmail/connect` → navigate to `url` → Google → callback redirects to `#/settings?gmail=connected` |
+| connection status / disconnect | `GET /workspace/credentials` · `DELETE /workspace/credentials/:kind` |
 | inbox scanning | `POST /workspace/scan` · `GET /workspace/scan/status` |
+| developer: platform keys | `GET/PUT/PATCH/DELETE /platform/credentials[/:kind]` (PATCH = model picker / meta) |
+| lead drawer: CRM panel | `GET /leads/:id/crm` · push button disabled ("coming soon") |
+| developer: external push | `PUT /workspace/credentials/:kind` · `GET/POST/DELETE /workspace/api-keys` |
 
 A ready-to-paste `apiDataService.ts` wrapper (with the 401-refresh-retry loop) is in the [README](../README.md#point-the-dashboard-at-it).

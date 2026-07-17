@@ -24,6 +24,8 @@ model Workspace {
   credentials Credential[]
   apiKeys     ApiKey[]
   auditLogs   AuditLog[]
+  ignored     IgnoredThread[]
+  scanned     ScannedMessage[]
 }
 
 model User {
@@ -89,11 +91,16 @@ model Lead {
   replySent                Boolean         @default(false)
   lastTouchedAt            DateTime        @default(now())
   notes                    String          @default("")
+  /// Cached Zoho CRM matches [{module,id,name,company,email,phone,url}], refreshed by the scan's CRM pass.
+  crmRecords               Json            @default("[]")
+  crmCheckedAt             DateTime?
   deletedAt                DateTime?
   createdAt                DateTime        @default(now())
   updatedAt                DateTime        @updatedAt
   threads                  Thread[]
   timeline                 TimelineEvent[]
+  people                   Person[]
+  meetings                 Meeting[]
 
   @@unique([workspaceId, externalId])
   @@index([workspaceId])
@@ -112,7 +119,49 @@ model Thread {
   direction String
   date      DateTime
   snippet   String
+  personId  String?
+  person    Person?  @relation(fields: [personId], references: [id], onDelete: SetNull)
 
+  @@index([leadId])
+}
+
+/// A human connected to the lead: whoever reached out, meeting attendees,
+/// anyone in the conversation. Auto-maintained by the scanner and the
+/// meeting-enrichment pass; email threads hang off the person via Thread.personId.
+model Person {
+  id          String   @id @default(cuid())
+  leadId      String
+  lead        Lead     @relation(fields: [leadId], references: [id], onDelete: Cascade)
+  name        String
+  email       String   @default("")
+  role        String   @default("")
+  phone       String   @default("")
+  notes       String   @default("")
+  firstSeenAt DateTime @default(now())
+  lastSeenAt  DateTime @default(now())
+  threads     Thread[]
+
+  @@index([leadId])
+}
+
+/// A meeting matched to this lead (via attendee emails) from the connected
+/// meeting-transcript provider, with its AI dossier/tldr for enrichment.
+model Meeting {
+  id         String   @id @default(cuid())
+  leadId     String
+  lead       Lead     @relation(fields: [leadId], references: [id], onDelete: Cascade)
+  externalId String
+  title      String
+  startsAt   DateTime
+  endsAt     DateTime?
+  attendees  Json     @default("[]")
+  tldr       String   @default("")
+  dossier    String   @default("")
+  url        String   @default("")
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  @@unique([leadId, externalId])
   @@index([leadId])
 }
 
@@ -167,4 +216,54 @@ model AuditLog {
   at          DateTime  @default(now())
 
   @@index([workspaceId, at])
+}
+
+/// Platform-wide secrets managed only by the developer account
+/// (Anthropic API key, Google OAuth client). Not workspace-scoped.
+model PlatformCredential {
+  id             String   @id @default(cuid())
+  kind           String   @unique
+  encryptedValue String
+  meta           Json     @default("{}")
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+}
+
+/// Conversations the scorer judged irrelevant (newsletters, receipts, spam).
+/// They never become leads; remembering them here means re-scans skip them
+/// without spending AI tokens. This table IS the spam log.
+model IgnoredThread {
+  id          String    @id @default(cuid())
+  workspaceId String
+  workspace   Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  threadKey   String
+  subject     String    @default("")
+  fromAddress String    @default("")
+  at          DateTime  @default(now())
+
+  @@unique([workspaceId, threadKey])
+}
+
+/// Per-email audit log: every message a scan touches ends up here with what
+/// happened to it (the scanner's core invariant — nothing silently disappears).
+model ScannedMessage {
+  id           String    @id @default(cuid())
+  workspaceId  String
+  workspace    Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  messageId    String
+  threadRootId String    @default("")
+  subject      String    @default("")
+  fromEmail    String    @default("")
+  receivedAt   DateTime
+  /// processed_lead | merged_existing_lead | skipped_irrelevant |
+  /// skipped_own_sent | skipped_duplicate | failed_relevance | failed_scoring
+  status       String
+  decision     String    @default("")
+  confidence   Float?
+  reason       String    @default("")
+  lastError    String    @default("")
+  processedAt  DateTime  @default(now()) @updatedAt
+
+  @@unique([workspaceId, messageId])
+  @@index([workspaceId, status])
 }

@@ -37,7 +37,7 @@ export async function makeApp(overrides: Record<string, string> = {}): Promise<F
 
 export async function resetDb(app: FastifyInstance): Promise<void> {
   await app.prisma.$executeRawUnsafe(
-    'TRUNCATE "Workspace","User","RefreshToken","Lead","Thread","TimelineEvent","Credential","ApiKey","AuditLog" CASCADE',
+    'TRUNCATE "Workspace","User","RefreshToken","Lead","Thread","TimelineEvent","Credential","ApiKey","AuditLog","PlatformCredential","Person","Meeting","IgnoredThread","ScannedMessage" CASCADE',
   )
 }
 

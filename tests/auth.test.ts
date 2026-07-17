@@ -6,7 +6,7 @@ import { addMember, api, extractRefreshCookie, makeApp, resetDb, signup, testCon
 let app: FastifyInstance
 
 beforeAll(async () => {
-  app = await makeApp()
+  app = await makeApp({ DEVELOPER_EMAILS: 'dev@invites.test' })
   await resetDb(app)
 })
 
@@ -203,11 +203,23 @@ describe('invites and roles', () => {
     expect(creds.statusCode).toBe(403)
   })
 
-  it('ADMIN invitees can manage api keys', async () => {
+  it('api keys are developer-only: even OWNER/ADMIN get 403, the allowlisted developer succeeds', async () => {
     const owner = await signup(app, { email: 'owner3@invites.test', workspaceName: 'Invites Three' })
     const admin = await addMember(app, owner, 'admin3@invites.test', 'ADMIN')
-    const keys = await api(app, admin, { method: 'POST', url: '/api/v1/workspace/api-keys', payload: { name: 'k' } })
-    expect(keys.statusCode).toBe(201)
+    for (const session of [owner, admin]) {
+      const denied = await api(app, session, { method: 'POST', url: '/api/v1/workspace/api-keys', payload: { name: 'k' } })
+      expect(denied.statusCode).toBe(403)
+      expect(denied.json().error).toMatch(/developer/i)
+    }
+    const developer = await signup(app, { email: 'dev@invites.test', workspaceName: 'Dev Co' })
+    const created = await api(app, developer, { method: 'POST', url: '/api/v1/workspace/api-keys', payload: { name: 'k' } })
+    expect(created.statusCode).toBe(201)
+
+    // The developer flag rides on auth responses so the UI can badge the account.
+    const devMe = await api(app, developer, { method: 'GET', url: '/api/v1/auth/me' })
+    expect(devMe.json().user.developer).toBe(true)
+    const ownerMe = await api(app, owner, { method: 'GET', url: '/api/v1/auth/me' })
+    expect(ownerMe.json().user.developer).toBe(false)
   })
 })
 

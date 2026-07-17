@@ -8,7 +8,8 @@ let bob: Session
 let aliceLeadId: string
 
 beforeAll(async () => {
-  app = await makeApp()
+  // bob doubles as the platform developer so he can mint an ingest API key.
+  app = await makeApp({ DEVELOPER_EMAILS: 'bob@iso.test' })
   await resetDb(app)
   alice = await signup(app, { email: 'alice@iso.test', workspaceName: 'Alice Co' })
   bob = await signup(app, { email: 'bob@iso.test', workspaceName: 'Bob Co' })

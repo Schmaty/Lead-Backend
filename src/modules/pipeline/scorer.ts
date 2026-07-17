@@ -42,6 +42,15 @@ export function createAnthropic(apiKey: string): Anthropic {
   return new Anthropic({ apiKey })
 }
 
+/** Prior state of an ongoing conversation, so re-scores assess the deal as it now stands. */
+export interface ConversationContext {
+  previousSummary: string
+  /** Recent exchange, oldest first. Includes both sides ('in' = the lead, 'out' = the business). */
+  exchange: Array<{ direction: 'in' | 'out'; date: Date; subject: string; snippet: string }>
+  /** Meeting intel (from the transcript provider) tied to this lead, newest first. */
+  meetings?: Array<{ title: string; date: Date; tldr: string }>
+}
+
 function buildSystemPrompt(settings: WorkspaceSettings, workspaceName: string): string {
   return [
     `You score inbound email inquiries for "${workspaceName}", a small business that tracks its sales leads in a CRM.`,
@@ -50,22 +59,42 @@ function buildSystemPrompt(settings: WorkspaceSettings, workspaceName: string): 
     'Scores are integers 0-10. Deal values are USD estimates for the full engagement; use 0/0 when the email gives no basis for a number.',
     'Anything you estimate without direct evidence in the email belongs in inferredFields.',
     'Mark relevant=false for anything that is not a genuine potential-client inquiry (newsletters, receipts, automated mail, spam, vendors selling TO the business). Still fill in the other fields as best you can.',
+    'When conversation history is provided, this is an ongoing exchange: assess the deal as it NOW stands (not just the latest email), update the summary to say where things stand, set recommendedNextStep to the next move in this conversation, and write draftReply as the next reply in-thread.',
   ].join('\n')
 }
 
-function buildEmailBlock(email: InboundEmail): string {
+const EXCHANGE_LIMIT = 8
+
+function buildEmailBlock(email: InboundEmail, context?: ConversationContext): string {
   const body = email.text.length > 6000 ? `${email.text.slice(0, 6000)}\n…[truncated]` : email.text
-  return [
+  const parts: string[] = []
+  if (context) {
+    parts.push('=== CONVERSATION SO FAR ===')
+    if (context.previousSummary) parts.push(`Previous assessment: ${context.previousSummary}`, '')
+    for (const meeting of (context.meetings ?? []).slice(0, 3)) {
+      const tldr = meeting.tldr.length > 700 ? `${meeting.tldr.slice(0, 700)}…` : meeting.tldr
+      parts.push(`[MEETING · ${meeting.date.toISOString()}] ${meeting.title}`, tldr || '(no notes)', '')
+    }
+    for (const message of context.exchange.slice(-EXCHANGE_LIMIT)) {
+      const who = message.direction === 'in' ? 'THEM' : 'US'
+      const text = message.snippet.length > 800 ? `${message.snippet.slice(0, 800)}…` : message.snippet
+      parts.push(`[${who} · ${message.date.toISOString()}] ${message.subject}`, text, '')
+    }
+    parts.push('=== LATEST EMAIL (assess the conversation as it now stands) ===')
+  }
+  parts.push(
     `From: ${email.from.name ? `${email.from.name} <${email.from.address}>` : email.from.address}`,
     `Subject: ${email.subject}`,
     `Date: ${email.date.toISOString()}`,
     '',
     body,
-  ].join('\n')
+  )
+  return parts.join('\n')
 }
 
 /**
- * Score one inbound email with Claude. Structured outputs guarantee the shape;
+ * Score one inbound email with Claude — with the conversation so far when the
+ * email continues a known thread. Structured outputs guarantee the shape;
  * inquiryType is clamped to the workspace's configured list afterwards.
  */
 export async function scoreEmail(
@@ -73,13 +102,15 @@ export async function scoreEmail(
   email: InboundEmail,
   settings: WorkspaceSettings,
   workspaceName: string,
+  context?: ConversationContext,
+  model: string = SCORER_MODEL,
 ): Promise<ScoredLead> {
   const response = await client.messages.parse({
-    model: SCORER_MODEL,
+    model,
     max_tokens: 16000,
     thinking: { type: 'adaptive' },
     system: buildSystemPrompt(settings, workspaceName),
-    messages: [{ role: 'user', content: buildEmailBlock(email) }],
+    messages: [{ role: 'user', content: buildEmailBlock(email, context) }],
     output_config: { format: zodOutputFormat(scoredLeadSchema) },
   })
   const parsed = response.parsed_output
@@ -110,4 +141,47 @@ export function normalizeScoredLead(raw: ScoredLead, settings: WorkspaceSettings
     dealValueLow: Math.max(0, low),
     dealValueHigh: Math.max(0, high),
   }
+}
+
+/** Cheapest fast model — its only job is the relevance gate. */
+export const GATE_MODEL = 'claude-haiku-4-5'
+
+const relevanceSchema = z.object({
+  decision: z.enum(['relevant', 'irrelevant', 'unsure']).describe('relevant = a possible business inquiry worth full scoring; irrelevant = clearly not; unsure = escalate'),
+  confidence: z.number().min(0).max(1).describe('How certain you are, 0-1'),
+  reason: z.string().describe('One short sentence'),
+})
+
+export type RelevanceVerdict = z.infer<typeof relevanceSchema>
+
+/**
+ * Cheap relevance gate, run before the expensive scorer on new conversations.
+ * Irrelevant: newsletters, receipts, automated/calendar notifications,
+ * delivery failures, vendor/SEO pitches selling TO the business, promotions,
+ * generic spam, cold outreach with no buyer intent. Relevant: training /
+ * consulting / workshop / speaking inquiries, partnership requests with
+ * possible revenue, replies from prospects, orgs asking about AI programs,
+ * and vague-but-real business inquiries. Uncertainty escalates — never drops.
+ */
+export async function classifyRelevance(
+  client: Anthropic,
+  email: InboundEmail,
+  settings: WorkspaceSettings,
+  workspaceName: string,
+): Promise<RelevanceVerdict> {
+  const response = await client.messages.parse({
+    model: GATE_MODEL,
+    max_tokens: 2000,
+    system: [
+      `You are a fast relevance filter for "${workspaceName}", a business that sells training/consulting services. Decide ONLY whether this inbound email could be a genuine business inquiry worth deeper analysis.`,
+      'IRRELEVANT: newsletters, receipts, automated or calendar notifications, delivery failures, vendor/SEO pitches selling TO the business, promotions, generic spam, cold outreach with no real buyer intent, job applications.',
+      `RELEVANT: inquiries about ${settings.inquiryTypes.join(', ')}; consulting/advisory/workshop/speaking requests; partnership requests with possible revenue; replies from current prospects; schools/companies asking about AI programs; vague but real business inquiries.`,
+      'If in doubt, say "unsure" — uncertain emails are escalated, never discarded.',
+    ].join('\n'),
+    messages: [{ role: 'user', content: `From: ${email.from.name} <${email.from.address}>\nSubject: ${email.subject}\n\n${email.text.slice(0, 2500)}` }],
+    output_config: { format: zodOutputFormat(relevanceSchema) },
+  })
+  const parsed = response.parsed_output
+  if (!parsed) throw new Error(`Relevance gate returned no parseable output (stop_reason: ${response.stop_reason})`)
+  return parsed
 }

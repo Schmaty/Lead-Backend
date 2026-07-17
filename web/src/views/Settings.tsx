@@ -160,6 +160,7 @@ export default function SettingsView(): ReactNode {
               </div>
             </div>
           </div>
+          {desk.st.user?.developer && (
           <div style={card}>
             <div style={sectionTitle}>Win-probability mapping</div>
             <div style={sectionDesc}>
@@ -184,6 +185,7 @@ export default function SettingsView(): ReactNode {
               ))}
             </div>
           </div>
+          )}
         </div>
       )}
 
@@ -251,6 +253,11 @@ export default function SettingsView(): ReactNode {
                   <span style={{ fontSize: 13, fontWeight: 600 }}>{u.name}</span>
                   <span style={{ fontSize: 12, color: C.sub, flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis' }}>{u.email}</span>
                   <span style={{ fontSize: 11.5, color: C.faint }}>{u.lastLoginAt ? `Active ${fmtDate(u.lastLoginAt)}` : 'Invite pending'}</span>
+                  {u.developer && (
+                    <span style={{ fontSize: 10, fontWeight: 700, letterSpacing: '.08em', color: '#fff', background: A, borderRadius: 5, padding: '3px 7px', textTransform: 'uppercase' }}>
+                      Developer
+                    </span>
+                  )}
                   <span style={rolePill(u.role)}>{u.role}</span>
                 </div>
               ))}

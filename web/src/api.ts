@@ -2,6 +2,7 @@ import type {
   ApiKeyRow,
   Aggregates,
   CredentialRow,
+  CrmLookup,
   Lead,
   Role,
   ScanStatus,
@@ -144,7 +145,27 @@ export const api = {
     }),
   deleteCredential: (kind: string) => request<{ ok: boolean }>(`/workspace/credentials/${kind}`, { method: 'DELETE' }),
   scan: () => request<{ started: boolean }>('/workspace/scan', { method: 'POST' }),
+  /** One-shot deep import: 90 days of email + meetings + Zoho's open leads. */
+  importHistory: () => request<{ started: boolean }>('/workspace/import', { method: 'POST' }),
   scanStatus: () => request<ScanStatus>('/workspace/scan/status'),
+  /** Start the Google sign-in that connects this workspace's inbox. */
+  gmailConnect: () => request<{ url: string }>('/workspace/gmail/connect', { method: 'POST' }),
+
+  // ── platform (developer account only) ───────────────────────────────────
+  platformCredentials: () => request<{ credentials: CredentialRow[] }>('/platform/credentials'),
+  putPlatformCredential: (kind: string, value: string, meta?: Record<string, unknown>) =>
+    request<CredentialRow>(`/platform/credentials/${kind}`, {
+      method: 'PUT',
+      body: JSON.stringify(meta ? { value, meta } : { value }),
+    }),
+  deletePlatformCredential: (kind: string) =>
+    request<{ ok: boolean }>(`/platform/credentials/${kind}`, { method: 'DELETE' }),
+  /** Merge-update a platform credential's meta (e.g. the scorer model) without re-pasting the secret. */
+  patchPlatformCredential: (kind: string, meta: Record<string, unknown>) =>
+    request<{ kind: string; meta: Record<string, unknown> }>(`/platform/credentials/${kind}`, {
+      method: 'PATCH',
+      body: JSON.stringify({ meta }),
+    }),
   apiKeys: () => request<{ apiKeys: ApiKeyRow[] }>('/workspace/api-keys'),
   createApiKey: (name: string) =>
     request<{ id: string; name: string; prefix: string; key: string }>('/workspace/api-keys', post({ name })),
@@ -170,4 +191,6 @@ export const api = {
   patchLead: (id: string, patch: Record<string, unknown>) =>
     request<Lead>(`/leads/${id}`, { method: 'PATCH', body: JSON.stringify(patch) }),
   deleteLead: (id: string) => request<{ ok: boolean }>(`/leads/${id}`, { method: 'DELETE' }),
+  /** Zoho CRM records matched to this lead (read-only; push is coming soon). */
+  leadCrm: (id: string) => request<CrmLookup>(`/leads/${id}/crm`),
 }

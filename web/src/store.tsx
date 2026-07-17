@@ -145,6 +145,7 @@ export interface Desk {
   updateLead: (id: string, patch: Record<string, unknown>) => Promise<boolean>
   addLead: (form: AddForm) => Promise<void>
   deleteLead: (id: string) => Promise<void>
+  bulkDelete: (ids: string[]) => Promise<void>
   bulk: (ids: string[], patch: Record<string, unknown>, label: string) => Promise<void>
   markSent: (id: string, stage: string) => Promise<void>
   saveSettings: (patch: Record<string, unknown>) => Promise<boolean>
@@ -331,6 +332,26 @@ export function DeskProvider({ children }: { children: ReactNode }): ReactNode {
     }
   }
 
+  const bulkDelete = async (ids: string[]): Promise<void> => {
+    let deleted = 0
+    try {
+      for (const id of ids) {
+        await api.deleteLead(id)
+        deleted++
+      }
+    } catch (e) {
+      toast(errMsg(e))
+    }
+    if (deleted > 0) {
+      set((s) => ({
+        leads: s.leads.filter((l) => !ids.includes(l.id)),
+        selection: [],
+        detailId: s.detailId && ids.includes(s.detailId) ? null : s.detailId,
+      }))
+      toast(`Deleted ${deleted} lead${deleted === 1 ? '' : 's'}`)
+    }
+  }
+
   const bulk = async (ids: string[], patch: Record<string, unknown>, label: string): Promise<void> => {
     try {
       for (const id of ids) await api.patchLead(id, patch)
@@ -368,9 +389,17 @@ export function DeskProvider({ children }: { children: ReactNode }): ReactNode {
 
   const loadAdminData = async (): Promise<void> => {
     if (stRef.current.user?.role === 'MEMBER') return
+    // API keys are developer-only — a plain OWNER/ADMIN gets 403 there but
+    // must still see credential status, so the two loads are independent.
     try {
-      const [creds, keys] = await Promise.all([api.credentials(), api.apiKeys()])
-      set({ credentials: creds.credentials, apiKeys: keys.apiKeys, adminDataLoaded: true })
+      const creds = await api.credentials()
+      set({ credentials: creds.credentials, adminDataLoaded: true })
+    } catch (e) {
+      if (!(e instanceof ApiError && e.status === 403)) toast(errMsg(e))
+    }
+    try {
+      const keys = await api.apiKeys()
+      set({ apiKeys: keys.apiKeys })
     } catch (e) {
       if (!(e instanceof ApiError && e.status === 403)) toast(errMsg(e))
     }
@@ -505,6 +534,7 @@ export function DeskProvider({ children }: { children: ReactNode }): ReactNode {
     updateLead,
     addLead,
     deleteLead,
+    bulkDelete,
     bulk,
     markSent,
     saveSettings,
