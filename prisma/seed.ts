@@ -50,7 +50,6 @@ const STAGE_PATHS: Record<string, string[]> = {
   'Closed won': ['New', 'Contacted', 'Qualified', 'Proposal sent', 'Closed won'],
   'Closed lost': ['New', 'Contacted', 'Qualified', 'Closed lost'],
   'Not fit': ['New', 'Not fit'],
-  'Spam': ['New', 'Spam'],
 }
 
 const LEADS: LeadDef[] = [
@@ -303,17 +302,6 @@ const LEADS: LeadDef[] = [
     sum: 'Vendor pitching their LMS platform; no training demand on their side.',
     fit: 2, urg: 2, score: 2, next: 'No action — archived as vendor pitch',
     reasons: [], risks: ['Selling to us, not buying'], inf: [], stage: 'Not fit', owner: 'sam', days: 38 },
-  // ---- Spam (2) ----
-  { n: 'Moonshot Coins', e: 'winner@moonshot-coins.example', o: 'Moonshot Coins', src: 'Other',
-    iq: 'Other', subj: 'You have been selected!!!',
-    sum: 'Crypto giveaway spam; no legitimate inquiry content.',
-    fit: 1, urg: 1, score: 2, reasons: [], risks: ['Spam pattern'], inf: [],
-    stage: 'Spam', owner: null, days: 21 },
-  { n: 'Rank Rocket SEO', e: 'blast@rank-rocket-seo.example', o: 'Rank Rocket SEO', src: 'Email',
-    iq: 'Vendor pitch', subj: 'Rank #1 on Google in 7 days',
-    sum: 'Bulk SEO cold blast; irrelevant to training services.',
-    fit: 1, urg: 1, score: 2, reasons: [], risks: ['Bulk sender'], inf: [],
-    stage: 'Spam', owner: null, days: 35 },
 ]
 
 interface EventRow { type: string; at: Date; actor: string; detail: string }
@@ -323,7 +311,7 @@ function buildTimeline(d: LeadDef, receivedAt: Date, followUpDate: Date | null, 
   const span = Math.max(now.getTime() - receivedAt.getTime(), DAY / 2)
   const step = span / (path.length + 2)
   const at = (k: number): Date => new Date(receivedAt.getTime() + step * k)
-  const events: EventRow[] = [{ type: 'created', at: receivedAt, actor: 'system', detail: `Ingested from n8n (${d.src})` }]
+  const events: EventRow[] = [{ type: 'created', at: receivedAt, actor: 'system', detail: `Scanned from inbox (${d.src})` }]
   for (let i = 1; i < path.length; i++) {
     events.push({ type: 'stage_change', at: at(i), actor, detail: `${path[i - 1]} → ${path[i]}` })
   }
@@ -336,7 +324,6 @@ function buildTimeline(d: LeadDef, receivedAt: Date, followUpDate: Date | null, 
 }
 
 function buildThreads(d: LeadDef, externalId: string, receivedAt: Date): Omit<Prisma.ThreadCreateManyInput, 'leadId'>[] {
-  if (d.stage === 'Spam') return []
   const slug = externalId.replace(/-/g, '')
   const url = (k: string): string => `https://mail.google.com/mail/u/0/#all/${slug}${k}`
   const threads: Omit<Prisma.ThreadCreateManyInput, 'leadId'>[] = [

@@ -106,7 +106,7 @@ beforeAll(async () => {
     {
       name: 'Spam Sally',
       email: 's6@f.test',
-      stage: 'Spam',
+      stage: 'Not fit',
       leadScore: 2,
       source: 'Other',
       inquiryType: 'Other',
@@ -310,7 +310,7 @@ describe('aggregates', () => {
       'Proposal sent': 1,
       'Closed won': 1,
       'Closed lost': 1,
-      Spam: 1,
+      'Not fit': 1,
     })
     expect(aggregates.countByTier).toEqual({ hot: 3, warm: 2, cold: 3 })
     expect(aggregates.wonCount).toBe(1)
@@ -320,7 +320,7 @@ describe('aggregates', () => {
     expect(aggregates.needsAttentionCount).toBe(5)
 
     // pipelineExpectedValue = Σ expectedValue over non-closed items, self-consistent with the list.
-    const closed = ['Closed won', 'Closed lost', 'Not fit', 'Spam']
+    const closed = ['Closed won', 'Closed lost', 'Not fit']
     const expected = items
       .filter((item: { stage: string }) => !closed.includes(item.stage))
       .reduce((sum: number, item: { expectedValue: number }) => sum + item.expectedValue, 0)

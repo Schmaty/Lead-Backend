@@ -46,7 +46,10 @@ export default async function platformRoutes(app: FastifyInstance): Promise<void
       credentials: credentials.map((credential) => {
         let maskedValue = '(unreadable)'
         try {
-          maskedValue = maskSecret(decryptSecret(credential.encryptedValue, config.encryptionKey))
+          const raw = decryptSecret(credential.encryptedValue, config.encryptionKey)
+          // ZOHO_CRM stores a JSON blob {clientSecret, refreshToken} — masking
+          // that verbatim reads as gibberish, so show a clean "connected" label.
+          maskedValue = credential.kind === 'ZOHO_CRM' ? '•••••••• connected' : maskSecret(raw)
         } catch {
           /* wrong key or corrupted blob — never leak details */
         }
