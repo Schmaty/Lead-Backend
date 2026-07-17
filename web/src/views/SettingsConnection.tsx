@@ -125,6 +125,8 @@ export default function ConnectionTab(): ReactNode {
             `${r.merged} merged`,
             ...(r.replies ? [`${r.replies} replies tracked`] : []),
             ...(r.meetings ? [`${r.meetings} meetings attached`] : []),
+            ...(r.crm ? [`${r.crm} CRM matches`] : []),
+            ...(r.ignored ? [`${r.ignored} spam ignored`] : []),
           ]
           desk.toast(`Scan complete — ${parts.join(', ')}`)
         }
@@ -212,7 +214,9 @@ export default function ConnectionTab(): ReactNode {
             </div>
             <div style={{ fontSize: 12, color: C.sub, marginTop: 2, lineHeight: 1.45 }}>
               {scan?.running
-                ? scan.progress?.phase === 'meetings'
+                ? scan.progress?.phase === 'crm'
+                  ? `Cross-checking the CRM…${scan.progress.crm ? ` ${scan.progress.crm} matched` : ''}`
+                  : scan.progress?.phase === 'meetings'
                   ? `Matching meetings to leads…${scan.progress.meetings ? ` ${scan.progress.meetings} attached` : ''}`
                   : scan.progress?.phase === 'replies'
                   ? `Checking sent mail for your replies…${scan.progress.replies ? ` ${scan.progress.replies} tracked` : ''}`
@@ -223,7 +227,7 @@ export default function ConnectionTab(): ReactNode {
                     : 'Connecting to the inbox and reading new mail…'
                 : configured
                   ? scan?.lastScanAt
-                    ? `Last scan ${fmtDate(scan.lastScanAt)}${lastResult ? ` — ${lastResult.imported} new, ${lastResult.merged} merged, ${lastResult.replies} replies${lastResult.meetings ? `, ${lastResult.meetings} meetings` : ''}${lastResult.errors.length ? `, ${lastResult.errors.length} errors` : ''}` : ''}`
+                    ? `Last scan ${fmtDate(scan.lastScanAt)}${lastResult ? ` — ${lastResult.imported} new, ${lastResult.merged} merged, ${lastResult.replies} replies${lastResult.meetings ? `, ${lastResult.meetings} meetings` : ''}${lastResult.crm ? `, ${lastResult.crm} CRM matches` : ''}${lastResult.ignored ? `, ${lastResult.ignored} spam ignored` : ''}${lastResult.errors.length ? `, ${lastResult.errors.length} errors` : ''}` : ''}`
                     : 'Ready — the first scan reads the last 7 days of mail.'
                   : mailboxConnected && !scan?.aiReady
                     ? 'Mailbox connected. AI scoring isn’t enabled yet — your developer needs to finish platform setup.'
@@ -377,7 +381,7 @@ export default function ConnectionTab(): ReactNode {
                     </span>
                   </div>
                   <div style={{ fontSize: 11.5, color: C.faint, marginTop: 1 }}>
-                    Read access now (CRM matches show on each lead){zohoCred && typeof zohoCred.meta.clientId === 'string' ? ` — client ${zohoCred.meta.clientId.slice(0, 18)}…` : ''}. Pushing leads to Zoho ships later and needs a WRITE-scoped token.
+                    CRM data pulls automatically on every scan (matches, org, phone numbers land on the lead){zohoCred && typeof zohoCred.meta.clientId === 'string' ? ` — client ${zohoCred.meta.clientId.slice(0, 18)}…` : ''}. Pushing leads to Zoho ships later and needs a WRITE-scoped token.
                   </div>
                 </div>
                 {zohoCred && <StoredValue cred={zohoCred} onRemove={() => void removePlatform('ZOHO_CRM')} />}

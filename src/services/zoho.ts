@@ -17,6 +17,7 @@ export interface CrmRecord {
   name: string
   company: string
   email: string
+  phone: string
   /** Deep link into the Zoho CRM UI. */
   url: string
 }
@@ -87,6 +88,8 @@ async function getAccessToken(config: ZohoConfig): Promise<string> {
 interface ZohoRow {
   id?: string
   Email?: string | null
+  Phone?: string | null
+  Mobile?: string | null
   Last_Name?: string | null
   First_Name?: string | null
   Full_Name?: string | null
@@ -112,6 +115,7 @@ function normalizeRow(module: CrmRecord['module'], row: ZohoRow): CrmRecord {
     name,
     company: company ?? '',
     email: row.Email ?? '',
+    phone: row.Phone ?? row.Mobile ?? '',
     url: `https://crm.zoho.com/crm/tab/${module}/${row.id ?? ''}`,
   }
 }

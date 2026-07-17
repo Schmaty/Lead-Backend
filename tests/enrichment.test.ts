@@ -316,6 +316,43 @@ describe('Zoho CRM', () => {
     }
   })
 
+  it('the CRM pull runs inside every scan: caches matches, logs them, fills phones', async () => {
+    // Reset the cache so the scan's stale-lead sweep picks this lead up.
+    const detail0 = await leadDetail()
+    await app.prisma.lead.update({ where: { id: detail0.id }, data: { crmCheckedAt: null } })
+
+    clearZohoTokenCacheForTesting()
+    const restore = setZohoDepsForTesting({
+      async fetchJson(url) {
+        if (url.includes('/oauth/v2/token')) return { status: 200, json: { access_token: 'zoho-access-2', expires_in: 3600 } }
+        if (url.includes('/Contacts/search') && url.includes('jordan%40client.example')) {
+          return {
+            status: 200,
+            json: { data: [{ id: 'z-201', First_Name: 'Jordan', Last_Name: 'Wells', Email: 'jordan@client.example', Phone: '+1 555 0100', Account_Name: { name: 'Client Example Inc' } }] },
+          }
+        }
+        return { status: 204, json: null }
+      },
+    })
+    try {
+      const result = await runScan(app.prisma, testConfig(ENV), owner.workspace.id, deps([]))
+      expect(result.crm).toBe(1)
+
+      const detail = await leadDetail()
+      expect(detail.crmCheckedAt).toBeTruthy()
+      expect(detail.crmRecords.some((r: { id: string }) => r.id === 'z-201')).toBe(true)
+      expect(detail.timeline.some((e: { type: string }) => e.type === 'crm_match')).toBe(true)
+      const jordan = detail.people.find((p: { email: string }) => p.email === 'jordan@client.example')
+      expect(jordan.phone).toBe('+1 555 0100')
+
+      // Second scan: already checked and untouched → no repeat Zoho traffic counted.
+      const again = await runScan(app.prisma, testConfig(ENV), owner.workspace.id, deps([]))
+      expect(again.crm).toBe(0)
+    } finally {
+      restore()
+    }
+  })
+
   it('push to CRM is built but gated: 501 coming soon', async () => {
     const detail = await leadDetail()
     const res = await api(app, owner, { method: 'POST', url: `/api/v1/leads/${detail.id}/crm/push` })

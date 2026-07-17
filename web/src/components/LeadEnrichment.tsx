@@ -34,7 +34,12 @@ export default function LeadEnrichment({ lead }: { lead: Lead }): ReactNode {
     setCrm(null)
     let cancelled = false
     void api.getLead(lead.id).then((full) => {
-      if (!cancelled) setDetail(full)
+      if (cancelled) return
+      setDetail(full)
+      // The scan already pulls the CRM — show its cached matches instantly.
+      if (full.crmCheckedAt) {
+        setCrm({ available: true, records: full.crmRecords ?? [], checkedAt: full.crmCheckedAt, push: { comingSoon: true } })
+      }
     }).catch(() => undefined)
     return () => {
       cancelled = true
@@ -133,7 +138,12 @@ export default function LeadEnrichment({ lead }: { lead: Lead }): ReactNode {
         ) : !crm.available ? (
           <div style={{ fontSize: 12.5, color: C.faint }}>Zoho isn&apos;t connected yet — the developer can add it under Settings → Platform.</div>
         ) : crm.records.length === 0 ? (
-          <div style={{ fontSize: 12.5, color: C.faint }}>No matching records in Zoho for this lead&apos;s contacts.</div>
+          <div style={{ fontSize: 12.5, color: C.faint }}>
+            No matching records in Zoho for this lead&apos;s contacts.{' '}
+            <button onClick={() => void lookupCrm()} disabled={crmBusy} style={{ background: 'none', border: 'none', color: A, cursor: 'pointer', fontSize: 12, fontWeight: 600, padding: 0 }}>
+              {crmBusy ? 'Checking…' : 'Re-check'}
+            </button>
+          </div>
         ) : (
           <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
             {crm.records.map((record) => (

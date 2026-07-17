@@ -42,6 +42,8 @@ export function serializeLead(lead: LeadWithRelations): Record<string, unknown> 
     replySent: lead.replySent,
     lastTouchedAt: lead.lastTouchedAt,
     notes: lead.notes,
+    crmRecords: lead.crmRecords,
+    crmCheckedAt: lead.crmCheckedAt,
     createdAt: lead.createdAt,
     updatedAt: lead.updatedAt,
   }

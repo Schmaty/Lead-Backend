@@ -6,7 +6,8 @@ import { workspaceId } from '../../middleware/workspaceScope.js'
 import { audit } from '../../services/audit.js'
 import { applyComputed, computeExpectedValue } from '../../services/leadCompute.js'
 import { getZohoConfig } from '../../services/platformCredentials.js'
-import { CRM_PUSH_ENABLED, searchCrmByEmails } from '../../services/zoho.js'
+import { syncLeadCrm } from '../../services/crmSync.js'
+import { CRM_PUSH_ENABLED } from '../../services/zoho.js'
 import { resolveSettings, type WorkspaceSettings } from '../../types/settings.js'
 import { buildLeadWhere, computeAggregates } from './query.js'
 import {
@@ -156,12 +157,13 @@ export default async function leadsRoutes(app: FastifyInstance): Promise<void> {
     if (!lead) throw new AppError(404, 'Lead not found')
     const zoho = await getZohoConfig(prisma, config)
     if (!zoho) {
-      return { available: false, records: [], push: { comingSoon: true } }
+      return { available: false, records: [], checkedAt: null, push: { comingSoon: true } }
     }
-    const emails = [lead.email, ...lead.people.map((person) => person.email)].filter(Boolean)
     try {
-      const records = await searchCrmByEmails(zoho, emails)
-      return { available: true, records, push: { comingSoon: true } }
+      // Same pull the scan runs: caches on the lead, logs new matches,
+      // backfills org + person phones.
+      const { records } = await syncLeadCrm(prisma, zoho, lead.id)
+      return { available: true, records, checkedAt: new Date(), push: { comingSoon: true } }
     } catch (err) {
       app.log.error({ err, leadId: id }, 'zoho lookup failed')
       throw new AppError(502, 'CRM lookup failed — check the Zoho connection')

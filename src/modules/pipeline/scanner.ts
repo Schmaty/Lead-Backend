@@ -8,6 +8,7 @@ import {
   type AmbientInsight,
   type AmbientMeeting,
 } from '../../services/ambient.js'
+import { syncLeadCrm } from '../../services/crmSync.js'
 import { upsertLeadByExternalId, type UpsertThread } from '../../services/leadUpsert.js'
 import { upsertPerson } from '../../services/people.js'
 import {
@@ -15,8 +16,10 @@ import {
   getGoogleOauthClient,
   getPlatformAnthropicKey,
   getScorerModel,
+  getZohoConfig,
   type AmbientConfig,
   type GoogleOauthClient,
+  type ZohoConfig,
 } from '../../services/platformCredentials.js'
 import { resolveSettings, type WorkspaceSettings } from '../../types/settings.js'
 import { googleOauth } from './googleOauth.js'
@@ -58,17 +61,21 @@ export interface ScanResult {
   updated: number
   /** Own-address inbox mail ignored. */
   skipped: number
+  /** Irrelevant conversations (newsletters/receipts/spam) — never become leads, remembered so they cost no future tokens. */
+  ignored: number
   /** Outbound replies detected in sent mail and attached to leads. */
   replies: number
   /** Meetings (from the transcript provider) newly attached to leads. */
   meetings: number
+  /** Leads that gained new CRM matches in the Zoho pull pass. */
+  crm: number
   errors: string[]
 }
 
 /** Live progress while a scan runs — what the dashboard banner renders. */
 export interface ScanProgress {
   /** 'connecting' during IMAP fetch; 'scoring' per conversation; 'replies' during the sent-mail pass; 'meetings' during transcript enrichment. */
-  phase: 'connecting' | 'scoring' | 'replies' | 'meetings'
+  phase: 'connecting' | 'scoring' | 'replies' | 'meetings' | 'crm'
   /** Conversations to score (not raw emails). */
   total: number
   processed: number
@@ -76,8 +83,10 @@ export interface ScanProgress {
   merged: number
   updated: number
   skipped: number
+  ignored: number
   replies: number
   meetings: number
+  crm: number
 }
 
 interface ScanState {
@@ -153,6 +162,8 @@ interface ScanCredentials {
   scorerModel: string
   /** Meeting-transcript provider, when the developer connected one. */
   ambient: AmbientConfig | null
+  /** Zoho CRM (read side), when the developer connected it. */
+  zoho: ZohoConfig | null
   /** The workspace credential row that carries the lastScanAt cursor in meta. */
   credentialId: string
   lastScanAt: Date | null
@@ -181,7 +192,7 @@ export async function resolveScanSetup(
   config: AppConfig,
   workspaceId: string,
 ): Promise<{ info: ScanConfigInfo; credentials: ScanCredentials | null }> {
-  const [oauthCred, imapCred, legacyAnthropic, platformKey, googleClient, scorerModel, ambient] = await Promise.all([
+  const [oauthCred, imapCred, legacyAnthropic, platformKey, googleClient, scorerModel, ambient, zoho] = await Promise.all([
     prisma.credential.findUnique({ where: { workspaceId_kind: { workspaceId, kind: GMAIL_OAUTH_KIND } } }),
     prisma.credential.findUnique({ where: { workspaceId_kind: { workspaceId, kind: GMAIL_IMAP_KIND } } }),
     prisma.credential.findUnique({ where: { workspaceId_kind: { workspaceId, kind: LEGACY_ANTHROPIC_KIND } } }),
@@ -189,6 +200,7 @@ export async function resolveScanSetup(
     getGoogleOauthClient(prisma, config),
     getScorerModel(prisma, config),
     getAmbientConfig(prisma, config),
+    getZohoConfig(prisma, config),
   ])
 
   let anthropicApiKey = platformKey
@@ -213,6 +225,7 @@ export async function resolveScanSetup(
       anthropicApiKey,
       scorerModel,
       ambient,
+      zoho,
       credentialId: oauthCred.id,
       lastScanAt: oauthMeta.lastScanAt ? new Date(oauthMeta.lastScanAt) : null,
       refreshToken: decryptSecret(oauthCred.encryptedValue, config.encryptionKey),
@@ -227,6 +240,7 @@ export async function resolveScanSetup(
       anthropicApiKey,
       scorerModel,
       ambient,
+      zoho,
       credentialId: imapCred.id,
       lastScanAt: imapMeta.lastScanAt ? new Date(imapMeta.lastScanAt) : null,
       pass: decryptSecret(imapCred.encryptedValue, config.encryptionKey),
@@ -321,7 +335,7 @@ export async function runScan(
 
   state.running = true
   state.lastError = undefined
-  const progress: ScanProgress = { phase: 'connecting', total: 0, processed: 0, imported: 0, merged: 0, updated: 0, skipped: 0, replies: 0, meetings: 0 }
+  const progress: ScanProgress = { phase: 'connecting', total: 0, processed: 0, imported: 0, merged: 0, updated: 0, skipped: 0, ignored: 0, replies: 0, meetings: 0, crm: 0 }
   state.progress = progress
   const startedAt = new Date()
   try {
@@ -343,7 +357,7 @@ export async function runScan(
     }
 
     const emails = await deps.fetchEmails(mailbox, since, MAX_EMAILS_PER_SCAN)
-    const result: ScanResult = { at: startedAt.toISOString(), scanned: emails.length, imported: 0, merged: 0, updated: 0, skipped: 0, replies: 0, meetings: 0, errors: [] }
+    const result: ScanResult = { at: startedAt.toISOString(), scanned: emails.length, imported: 0, merged: 0, updated: 0, skipped: 0, ignored: 0, replies: 0, meetings: 0, crm: 0, errors: [] }
     const ownAddress = credentials.email.toLowerCase()
 
     // ── Group inbound mail into conversations ────────────────────────────────
@@ -364,6 +378,7 @@ export async function runScan(
 
     progress.phase = 'scoring'
     progress.total = groups.size
+    const touchedLeadIds = new Set<string>()
 
     // ── Score each conversation and upsert its lead ──────────────────────────
     for (const [threadKey, group] of groups) {
@@ -375,6 +390,18 @@ export async function runScan(
             meetings: { orderBy: { startsAt: 'desc' }, take: 3 },
           },
         })
+
+        // Previously judged irrelevant → skip without spending an AI call.
+        if (!existing) {
+          const remembered = await prisma.ignoredThread.findUnique({
+            where: { workspaceId_threadKey: { workspaceId, threadKey } },
+          })
+          if (remembered) {
+            result.ignored++
+            progress.ignored++
+            continue
+          }
+        }
 
         // Overlap re-read with nothing new → no AI call, nothing to change.
         const knownUrls = new Set(existing?.threads.map((t) => t.url) ?? [])
@@ -421,7 +448,24 @@ export async function runScan(
           context,
           credentials.scorerModel,
         )
-        const spamStage = settings.stages.find((s) => /spam/i.test(s))
+
+        // Not a real inquiry → never enters the system. The IgnoredThread row
+        // is the log, and it makes every future scan skip this conversation
+        // for free. (An existing lead whose reply scores irrelevant still
+        // merges — active conversations are never silently dropped.)
+        if (!scored.relevant && !existing) {
+          try {
+            await prisma.ignoredThread.create({
+              data: { workspaceId, threadKey, subject: newest.subject.slice(0, 200), fromAddress: newest.from.address },
+            })
+          } catch {
+            /* concurrent scan already recorded it */
+          }
+          result.ignored++
+          progress.ignored++
+          continue
+        }
+
         const first = group[0]!
         const { lead, created, addedThreads } = await upsertLeadByExternalId(
           prisma,
@@ -449,11 +493,12 @@ export async function runScan(
             riskFlags: scored.riskFlags,
             inferredFields: scored.inferredFields,
             threads: group.map((email) => asThread(email, 'in')),
-            initialStage: !scored.relevant && spamStage ? spamStage : 'New',
+            initialStage: 'New',
             createdDetail: `Scanned from inbox (${newest.from.address})`,
           },
           { threadMode: 'merge' },
         )
+        touchedLeadIds.add(lead.id)
         if (created) {
           result.imported++
           progress.imported++
@@ -521,6 +566,34 @@ export async function runScan(
         }
       } catch (err) {
         result.errors.push(`meetings: ${err instanceof Error ? err.message : String(err)}`)
+      }
+    }
+
+    // ── Pull the CRM's view of leads (read-only; push stays coming-soon) ────
+    if (credentials.zoho) {
+      progress.phase = 'crm'
+      try {
+        const stale = await prisma.lead.findMany({
+          where: { workspaceId, deletedAt: null, crmCheckedAt: null, id: { notIn: [...touchedLeadIds] } },
+          orderBy: { createdAt: 'desc' },
+          take: 10,
+          select: { id: true },
+        })
+        for (const leadId of [...touchedLeadIds, ...stale.map((row) => row.id)]) {
+          try {
+            const { newMatches } = await syncLeadCrm(prisma, credentials.zoho, leadId)
+            if (newMatches > 0) {
+              result.crm++
+              progress.crm++
+            }
+          } catch (err) {
+            // One failure (bad token, rate limit) would repeat for every lead.
+            result.errors.push(`crm: ${err instanceof Error ? err.message : String(err)}`)
+            break
+          }
+        }
+      } catch (err) {
+        result.errors.push(`crm: ${err instanceof Error ? err.message : String(err)}`)
       }
     }
 

@@ -181,15 +181,21 @@ describe('scan configuration and permissions', () => {
 })
 
 describe('runScan', () => {
-  it('scores new mail into leads, routes irrelevant mail to Spam, skips own address', async () => {
+  it('imports real inquiries, never admits spam, skips own address', async () => {
     const result = await runScan(app.prisma, testConfig(), owner.workspace.id, fakeDeps([hotEmail, spamEmail, selfEmail]))
     expect(result.scanned).toBe(3)
-    expect(result.imported).toBe(2)
+    expect(result.imported).toBe(1)
+    expect(result.ignored).toBe(1) // the newsletter — never becomes a lead
     expect(result.skipped).toBe(1) // the workspace's own outbound mail
     expect(result.errors).toEqual([])
 
+    // Spam is logged to the ignore list, not the lead table.
     const list = await api(app, owner, { method: 'GET', url: '/api/v1/leads?pageSize=50' })
-    expect(list.json().total).toBe(2)
+    expect(list.json().total).toBe(1)
+    const remembered = await app.prisma.ignoredThread.findUnique({
+      where: { workspaceId_threadKey: { workspaceId: owner.workspace.id, threadKey: spamEmail.messageId } },
+    })
+    expect(remembered?.fromAddress).toBe('noreply@megadeals.example')
 
     const hot = list.json().items.find((l: { externalId: string }) => l.externalId === hotEmail.messageId)
     expect(hot.name).toBe('Dana Okafor')
@@ -199,9 +205,6 @@ describe('runScan', () => {
     expect(hot.expectedValue).toBe(4950)
     expect(hot.stage).toBe('New')
 
-    const spam = list.json().items.find((l: { externalId: string }) => l.externalId === spamEmail.messageId)
-    expect(spam.stage).toBe('Spam')
-
     const detail = await api(app, owner, { method: 'GET', url: `/api/v1/leads/${hot.id}` })
     expect(detail.json().threads).toHaveLength(1)
     expect(detail.json().threads[0].url).toContain('rfc822msgid')
@@ -209,16 +212,17 @@ describe('runScan', () => {
     expect(detail.json().timeline[0].detail).toContain('Scanned from inbox')
   })
 
-  it('is idempotent: re-scanning the same mail changes nothing and spends no AI calls', async () => {
+  it('is idempotent: known mail and remembered spam spend no AI calls', async () => {
     const scoreCalls: Array<{ messageId: string; context?: ConversationContext }> = []
     const result = await runScan(app.prisma, testConfig(), owner.workspace.id, fakeDeps([hotEmail, spamEmail], { scoreCalls }))
     expect(result.imported).toBe(0)
-    expect(result.updated).toBe(2)
-    // Every message was already stored — no re-scoring needed.
+    expect(result.updated).toBe(1) // hot thread already stored
+    expect(result.ignored).toBe(1) // spam remembered from last scan
+    // No re-scoring for either — the ignore list is the token saver.
     expect(scoreCalls).toHaveLength(0)
 
     const list = await api(app, owner, { method: 'GET', url: '/api/v1/leads?pageSize=50' })
-    expect(list.json().total).toBe(2)
+    expect(list.json().total).toBe(1)
   })
 
   it('human edits survive re-scans', async () => {
@@ -311,7 +315,8 @@ describe('scan route flow', () => {
         await new Promise((resolve) => setTimeout(resolve, 100))
       }
       expect(status.lastResult.scanned).toBe(2)
-      expect(status.lastResult.updated).toBe(2)
+      expect(status.lastResult.updated).toBe(1)
+      expect(status.lastResult.ignored).toBe(1)
       expect(status.lastError).toBeNull()
     } finally {
       restore()

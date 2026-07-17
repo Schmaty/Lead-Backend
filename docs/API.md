@@ -164,7 +164,7 @@ interface Lead {
 }
 ```
 
-Timeline event `type` values: `created`, `stage_change`, `owner_change`, `follow_up_set`, `note_added`, `email_received`, `reply_sent`, `meeting`, `win_probability_set`. `actor` is a user's display name or `"system"` (inbox scanner / ingest webhook). The scanner writes `email_received` when a new inbound message merges into an existing conversation, and `reply_sent` / `stage_change` (actor `system`) when it notices one of your own replies in sent mail.
+Timeline event `type` values: `created`, `stage_change`, `owner_change`, `follow_up_set`, `note_added`, `email_received`, `reply_sent`, `meeting`, `crm_match`, `win_probability_set`. `actor` is a user's display name or `"system"` (inbox scanner / ingest webhook). The scanner writes `email_received` when a new inbound message merges into an existing conversation, and `reply_sent` / `stage_change` (actor `system`) when it notices one of your own replies in sent mail.
 
 ### Computed-field semantics
 
@@ -267,7 +267,7 @@ Soft delete — the lead disappears from every list/detail/aggregate/analytics q
 ---
 
 ### `GET /leads/:id/crm` — Zoho CRM matches (read-only)
-Searches the connected Zoho CRM (Leads + Contacts modules) for the lead's email **and every person on its profile**. → `{ available, records: [{ module, id, name, company, email, url }], push: { comingSoon: true } }`. `available: false` (empty records) until the developer stores the `ZOHO_CRM` platform credential; `502` if Zoho rejects the lookup. `url` deep-links into the Zoho UI.
+Runs the same CRM pull the scan runs (results cache on the lead as `crmRecords`/`crmCheckedAt`; new matches log `crm_match`; org + person phones backfill). → `{ available, records: [{ module, id, name, company, email, phone, url }], checkedAt, push: { comingSoon: true } }`. The dashboard shows cached matches instantly and uses this endpoint as a refresh. `available: false` (empty records) until the developer stores the `ZOHO_CRM` platform credential; `502` if Zoho rejects the lookup. `url` deep-links into the Zoho UI.
 
 ### `POST /leads/:id/crm/push` — coming soon
 Always `501 { "error": "Pushing to Zoho CRM is coming soon", "comingSoon": true }`. The feature is built but gated: current platform tokens are read-only; it ships once a WRITE-scoped Zoho token is connected. Frontends should render the button disabled with a "Coming soon" tag.
@@ -398,14 +398,14 @@ Once a mailbox is connected (`GMAIL_OAUTH`, or the `GMAIL_IMAP` fallback) **and*
 - A **reply to a known conversation** merges into its lead: the message is appended to the lead's threads, an `email_received` timeline event is written, and the re-score runs **with the prior exchange + previous summary as context** so the assessment reflects where the deal now stands. `receivedAt` (first contact) and all human-owned fields survive (§8 semantics).
 - **Already-seen messages** (the overlap window re-reads ~1h of history) are recognized by message identity and spend **no** AI calls.
 
-After the inbox pass, the scanner reads the account's **sent-mail folder** (found via the special-use `\Sent` flag) and attaches your own replies to the leads they answer: outbound thread entry, `replySent: true`, a `reply_sent` timeline event, and — only for leads still in the first pipeline stage — an automatic advance to the stage matching `/contact/i` with a `stage_change` event (actor `system`). Leads a human has moved are never touched.
+When Zoho is connected, a **CRM pull pass** also runs every scan: leads touched this scan (plus up to 10 never-checked leads) are searched in Zoho by their people's emails; matches are cached on the lead (`crmRecords`, `crmCheckedAt`), new ones logged as `crm_match` timeline events, and the CRM's company/phone backfill empty fields — read-only toward Zoho. After the inbox pass, the scanner reads the account's **sent-mail folder** (found via the special-use `\Sent` flag) and attaches your own replies to the leads they answer: outbound thread entry, `replySent: true`, a `reply_sent` timeline event, and — only for leads still in the first pipeline stage — an automatic advance to the stage matching `/contact/i` with a `stage_change` event (actor `system`). Leads a human has moved are never touched.
 
-Irrelevant mail (newsletters, receipts, spam) is filed to the stage matching `/spam/i` — or dropped if no such stage exists; mail from the workspace's own address is skipped in the inbox pass; at most 25 inbound emails (and 50 sent) are read per scan; the first scan looks back 7 days. A legacy per-workspace `ANTHROPIC_API_KEY` credential still works as an AI-key fallback for pre-platform installs.
+Irrelevant mail (newsletters, receipts, spam) **never becomes a lead**: the conversation is recorded in the `IgnoredThread` table (the spam log) and every future scan skips it before any AI call; mail from the workspace's own address is skipped in the inbox pass; at most 25 inbound emails (and 50 sent) are read per scan; the first scan looks back 7 days. A legacy per-workspace `ANTHROPIC_API_KEY` credential still works as an AI-key fallback for pre-platform installs.
 
 | Call | Role | Returns |
 |---|---|---|
 | `POST /workspace/scan` | OWNER/ADMIN | `202 { started: true }` — the scan runs in the background. `400` if not configured, `409` if a scan is already running. Audited. |
-| `GET /workspace/scan/status` | any | `{ configured, method: "oauth"\|"imap"\|null, email, googleSignInAvailable, aiReady, running, progress, lastScanAt, pollMinutes, lastResult, lastError }` where `progress` (non-null only while running) = `{ phase: "connecting"\|"scoring"\|"replies"\|"meetings", total, processed, imported, merged, updated, skipped, replies, meetings }` (`total` counts conversations, not raw emails) and `lastResult` = `{ at, scanned, imported, merged, updated, skipped, replies, meetings, errors: string[] }` |
+| `GET /workspace/scan/status` | any | `{ configured, method: "oauth"\|"imap"\|null, email, googleSignInAvailable, aiReady, running, progress, lastScanAt, pollMinutes, lastResult, lastError }` where `progress` (non-null only while running) = `{ phase: "connecting"\|"scoring"\|"replies"\|"meetings"\|"crm", total, processed, imported, merged, updated, skipped, ignored, replies, meetings, crm }` (`total` counts conversations, not raw emails) and `lastResult` = `{ at, scanned, imported, merged, updated, skipped, ignored, replies, meetings, crm, errors: string[] }` |
 
 Status drives the whole Settings UI: `email` null → show "Sign in with Google" (disabled with a call-your-developer note when `googleSignInAvailable` is false); `email` set → show the connected mailbox + Disconnect; `aiReady` false → the developer hasn't stored the platform key yet. Frontend flow for "Scan now": POST, poll status every ~2 s rendering `progress` ("Scoring conversation 3 of 12…", then "Checking sent mail…") until `running` is false, then show `lastResult`/`lastError` and refresh the lead list.
 

@@ -145,6 +145,7 @@ export interface Desk {
   updateLead: (id: string, patch: Record<string, unknown>) => Promise<boolean>
   addLead: (form: AddForm) => Promise<void>
   deleteLead: (id: string) => Promise<void>
+  bulkDelete: (ids: string[]) => Promise<void>
   bulk: (ids: string[], patch: Record<string, unknown>, label: string) => Promise<void>
   markSent: (id: string, stage: string) => Promise<void>
   saveSettings: (patch: Record<string, unknown>) => Promise<boolean>
@@ -331,6 +332,26 @@ export function DeskProvider({ children }: { children: ReactNode }): ReactNode {
     }
   }
 
+  const bulkDelete = async (ids: string[]): Promise<void> => {
+    let deleted = 0
+    try {
+      for (const id of ids) {
+        await api.deleteLead(id)
+        deleted++
+      }
+    } catch (e) {
+      toast(errMsg(e))
+    }
+    if (deleted > 0) {
+      set((s) => ({
+        leads: s.leads.filter((l) => !ids.includes(l.id)),
+        selection: [],
+        detailId: s.detailId && ids.includes(s.detailId) ? null : s.detailId,
+      }))
+      toast(`Deleted ${deleted} lead${deleted === 1 ? '' : 's'}`)
+    }
+  }
+
   const bulk = async (ids: string[], patch: Record<string, unknown>, label: string): Promise<void> => {
     try {
       for (const id of ids) await api.patchLead(id, patch)
@@ -513,6 +534,7 @@ export function DeskProvider({ children }: { children: ReactNode }): ReactNode {
     updateLead,
     addLead,
     deleteLead,
+    bulkDelete,
     bulk,
     markSent,
     saveSettings,

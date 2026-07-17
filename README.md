@@ -50,7 +50,7 @@ Base path: `/api/v1`. All responses are JSON in camelCase. This section is a sum
 | Pipeline | `POST /api/v1/workspace/gmail/connect` | OWNER/ADMIN; returns the Google consent URL — clients connect their inbox by signing in |
 | | `GET /api/v1/auth/google/callback` | public (Google redirects here); stores the workspace's `GMAIL_OAUTH` refresh token, bounces back to Settings |
 | | `POST /api/v1/workspace/scan` | OWNER/ADMIN; kicks off an inbox scan in the background → `202 { started: true }` |
-| | `GET /api/v1/workspace/scan/status` | `{ configured, method, email, googleSignInAvailable, aiReady, running, progress, lastScanAt, pollMinutes, lastResult, lastError }` — `progress` reports live per-email counts while a scan runs |
+| | `GET /api/v1/workspace/scan/status` | `{ configured, method, email, googleSignInAvailable, aiReady, running, progress, lastScanAt, pollMinutes, lastResult, lastError }` — `progress`/`lastResult` report live counts (imported, merged, replies, meetings, CRM matches, spam ignored) |
 | Platform | `GET/PUT/PATCH/DELETE /api/v1/platform/credentials[/:kind]` | **developer-only**; kinds: `ANTHROPIC_API_KEY` (universal AI key; `meta.model` picks the scoring model), `GOOGLE_OAUTH_CLIENT`, `AMBIENT_API_KEY` (meeting AI), `ZOHO_CRM` (read now — push coming soon). PATCH updates meta only (e.g. the model picker) |
 | Leads | `GET /api/v1/leads` | filters/sort/search/pagination + `aggregates` (see below) |
 | | `GET /api/v1/leads/export.csv` | same filters, CSV download |
@@ -212,7 +212,7 @@ Either way, the api and web containers are bound to `127.0.0.1` — the edge is 
 
 ## Built-in inbox scanning
 
-The pipeline is part of this service — no external workflow tool. On the schedule set in Settings (default every 15 minutes), the API connects to the workspace's Gmail inbox over IMAP, reads mail newer than the last scan, scores each message with the Anthropic API (`claude-opus-4-8`, structured outputs), and upserts leads straight into Postgres. Genuine inquiries land in **New**; newsletters/receipts/spam are filed to the **Spam** stage so nothing silently disappears. Mail sent from the workspace's own address is skipped, at most 25 emails are scored per scan, and the first scan looks back 7 days.
+The pipeline is part of this service — no external workflow tool. On the schedule set in Settings (default every 15 minutes), the API connects to the workspace's Gmail inbox over IMAP, reads mail newer than the last scan, scores each message with the Anthropic API (`claude-opus-4-8`, structured outputs), and upserts leads straight into Postgres. Genuine inquiries land in **New**; newsletters/receipts/spam **never enter the system** — they're recorded on an ignore list (the spam log) so future scans skip them without spending AI tokens. Mail sent from the workspace's own address is skipped, at most 25 emails are scored per scan, and the first scan looks back 7 days.
 
 ### What a client does (once)
 
@@ -248,7 +248,7 @@ Every lead keeps a **people profile**: whoever reached out, every extra correspo
 
 With the **Ambient meeting AI** connected (developer: Settings → Platform), each scan also matches recent meetings to leads by attendee email: the meeting lands on the lead with its AI dossier + tldr and a link back to Ambient, attendees join the people profile, a `meeting` event hits the timeline — and the next re-score reads the meeting intel as context.
 
-With **Zoho CRM** connected, every lead's drawer gets a CRM panel that looks up matching Zoho Leads/Contacts for the lead's people (read-only, with deep links). **Pushing leads to Zoho is built but gated "coming soon"** — the current platform token carries read-only scopes; it ships once a WRITE-scoped token is connected.
+With **Zoho CRM** connected, every scan (Scan now and scheduled) also **pulls the CRM automatically**: matches for each lead's people are cached on the lead, logged on its timeline (`crm_match`), and used to backfill the org and person phone numbers — the drawer shows them instantly with deep links. Only **pushing** leads *to* Zoho is gated "coming soon" (the current platform token carries read-only scopes; it ships once a WRITE-scoped token is connected).
 
 The developer Platform card also carries a **scoring-model picker** (Opus 4.8 default, Sonnet 5, Sonnet 4.6, Haiku 4.5) — switch what Claude model scores mail without touching the key.
 

@@ -66,12 +66,14 @@ export interface CrmRecord {
   name: string
   company: string
   email: string
+  phone: string
   url: string
 }
 
 export interface CrmLookup {
   available: boolean
   records: CrmRecord[]
+  checkedAt: string | null
   push: { comingSoon: boolean }
 }
 
@@ -121,6 +123,8 @@ export interface Lead {
   threads?: Thread[]
   people?: Person[]
   meetings?: Meeting[]
+  crmRecords?: CrmRecord[]
+  crmCheckedAt?: string | null
   timeline?: TimelineEvent[]
   timeInStageHours?: number
 }
@@ -271,11 +275,15 @@ export interface ScanResult {
   replies: number
   /** Meetings newly attached to leads by the transcript provider. */
   meetings: number
+  /** Irrelevant conversations remembered and kept out of the system. */
+  ignored: number
+  /** Leads that gained new CRM matches in the Zoho pull. */
+  crm: number
   errors: string[]
 }
 
 export interface ScanProgress {
-  phase: 'connecting' | 'scoring' | 'replies' | 'meetings'
+  phase: 'connecting' | 'scoring' | 'replies' | 'meetings' | 'crm'
   /** Conversations to score, not raw emails. */
   total: number
   processed: number
@@ -283,8 +291,10 @@ export interface ScanProgress {
   merged: number
   updated: number
   skipped: number
+  ignored: number
   replies: number
   meetings: number
+  crm: number
 }
 
 export interface ScanStatus {

@@ -163,7 +163,7 @@ export default function FilterBar(): ReactNode {
             </div>
           </div>
           <div>
-            <div style={upLabel}>Expected value ($)</div>
+            <div style={upLabel}>Est. value ($)</div>
             <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
               <input type="number" min={0} placeholder="min" value={f.evMin} onChange={(e) => setFilter('evMin', e.target.value)} style={{ ...numIn, width: 82 }} />
               <span style={{ color: C.faint }}>–</span>

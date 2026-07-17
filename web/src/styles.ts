@@ -180,6 +180,7 @@ export function evDot(type: string): CSSProperties {
     owner_change: '#2A4B7C',
     email_received: '#2A4B7C',
     meeting: '#7C5CBF',
+    crm_match: '#2A4B7C',
     reply_sent: C.ok,
     note_added: C.warn,
     follow_up_set: '#8A6D3B',

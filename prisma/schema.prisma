@@ -24,6 +24,7 @@ model Workspace {
   credentials Credential[]
   apiKeys     ApiKey[]
   auditLogs   AuditLog[]
+  ignored     IgnoredThread[]
 }
 
 model User {
@@ -89,6 +90,9 @@ model Lead {
   replySent                Boolean         @default(false)
   lastTouchedAt            DateTime        @default(now())
   notes                    String          @default("")
+  /// Cached Zoho CRM matches [{module,id,name,company,email,phone,url}], refreshed by the scan's CRM pass.
+  crmRecords               Json            @default("[]")
+  crmCheckedAt             DateTime?
   deletedAt                DateTime?
   createdAt                DateTime        @default(now())
   updatedAt                DateTime        @updatedAt
@@ -222,4 +226,19 @@ model PlatformCredential {
   meta           Json     @default("{}")
   createdAt      DateTime @default(now())
   updatedAt      DateTime @updatedAt
+}
+
+/// Conversations the scorer judged irrelevant (newsletters, receipts, spam).
+/// They never become leads; remembering them here means re-scans skip them
+/// without spending AI tokens. This table IS the spam log.
+model IgnoredThread {
+  id          String    @id @default(cuid())
+  workspaceId String
+  workspace   Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  threadKey   String
+  subject     String    @default("")
+  fromAddress String    @default("")
+  at          DateTime  @default(now())
+
+  @@unique([workspaceId, threadKey])
 }

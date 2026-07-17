@@ -88,6 +88,8 @@ export default function DetailDrawer(): ReactNode {
     probTimer.current = setTimeout(() => void desk.updateLead(lead.id, { winProbability: Math.max(0, Math.min(1, pct / 100)) }), 350)
   }
   const canDelete = st.user!.role !== 'MEMBER'
+  // Probability math is developer-only; daily users see plain dollar figures.
+  const showTechnical = !!st.user?.developer
 
   return (
     <div style={{ position: 'fixed', inset: 0, zIndex: 200, display: 'flex', justifyContent: 'flex-end' }}>
@@ -210,19 +212,24 @@ export default function DetailDrawer(): ReactNode {
                 <div style={{ fontFamily: mono, fontSize: 15, fontWeight: 500 }}>{usd(lead.dealValueLow)}–{usd(lead.dealValueHigh)}</div>
               </div>
               <div style={{ textAlign: 'right' }}>
-                <div style={{ ...upLabel, letterSpacing: '.07em', marginBottom: 4 }}>Expected value</div>
+                <div style={{ ...upLabel, letterSpacing: '.07em', marginBottom: 4 }}>{showTechnical ? 'Expected value' : 'Est. value'}</div>
                 <div style={{ fontFamily: mono, fontSize: 22, fontWeight: 600, color: A }}>{usd(view.ev)}</div>
               </div>
             </div>
-            <div style={{ fontFamily: mono, fontSize: 12, color: C.sub, marginTop: 10, paddingTop: 12, borderTop: '1px solid rgba(18,67,59,.12)' }}>{breakdown}</div>
-            <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginTop: 12 }}>
-              <span style={{ fontSize: 12, color: C.body, flex: '0 0 auto' }}>Win probability</span>
-              <input type="range" min={0} max={100} step={5} defaultValue={prob} onChange={(e) => setProb(Number(e.target.value))} style={{ flex: 1, accentColor: A }} />
-              <span style={{ fontFamily: mono, fontSize: 13, fontWeight: 600, width: 44, textAlign: 'right', flex: '0 0 auto' }}>{prob}%</span>
-            </div>
-            <div style={{ fontSize: 11, color: C.faint, marginTop: 8 }}>
-              Expected deal value, weighted by likelihood — not net profit (cost-to-serve isn&apos;t modeled).
-            </div>
+            {/* The probability math is developer-only — daily users just see the number. */}
+            {showTechnical && (
+              <>
+                <div style={{ fontFamily: mono, fontSize: 12, color: C.sub, marginTop: 10, paddingTop: 12, borderTop: '1px solid rgba(18,67,59,.12)' }}>{breakdown}</div>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginTop: 12 }}>
+                  <span style={{ fontSize: 12, color: C.body, flex: '0 0 auto' }}>Win probability</span>
+                  <input type="range" min={0} max={100} step={5} defaultValue={prob} onChange={(e) => setProb(Number(e.target.value))} style={{ flex: 1, accentColor: A }} />
+                  <span style={{ fontFamily: mono, fontSize: 13, fontWeight: 600, width: 44, textAlign: 'right', flex: '0 0 auto' }}>{prob}%</span>
+                </div>
+                <div style={{ fontSize: 11, color: C.faint, marginTop: 8 }}>
+                  Expected deal value, weighted by likelihood — not net profit (cost-to-serve isn&apos;t modeled).
+                </div>
+              </>
+            )}
           </div>
 
           <div style={{ display: 'flex', alignItems: 'flex-start', gap: 11, border: '1px solid rgba(18,67,59,.25)', borderRadius: 12, padding: '14px 16px', marginBottom: 22 }}>
