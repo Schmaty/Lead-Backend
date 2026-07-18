@@ -9,13 +9,16 @@ import { decryptSecret } from '../crypto/secrets.js'
  *   the Claude model the scorer uses.
  * - GOOGLE_OAUTH_CLIENT: the Google OAuth app clients sign in through.
  *   value = client secret, meta.clientId = client ID.
+ * - MICROSOFT_OAUTH_CLIENT: the Azure AD app clients sign in through for
+ *   Outlook / Microsoft 365. value = client secret, meta.clientId = app (client)
+ *   ID, meta.tenant = directory ('common' by default).
  * - AMBIENT_API_KEY: the meeting-transcript provider (ambient.us) API key.
  *   meta.baseUrl overrides the default API host.
  * - ZOHO_CRM: value = JSON {"clientSecret","refreshToken"}; meta = { clientId,
  *   accountsUrl?, apiDomain? }. Current tokens are read-only — pushing to the
  *   CRM ships later and will need a WRITE-scoped token.
  */
-export const PLATFORM_CREDENTIAL_KINDS = ['ANTHROPIC_API_KEY', 'GOOGLE_OAUTH_CLIENT', 'AMBIENT_API_KEY', 'ZOHO_CRM'] as const
+export const PLATFORM_CREDENTIAL_KINDS = ['ANTHROPIC_API_KEY', 'GOOGLE_OAUTH_CLIENT', 'MICROSOFT_OAUTH_CLIENT', 'AMBIENT_API_KEY', 'ZOHO_CRM'] as const
 export type PlatformCredentialKind = (typeof PLATFORM_CREDENTIAL_KINDS)[number]
 
 /** Models the developer may pick for the scorer (Settings → Platform). */
@@ -57,6 +60,23 @@ export async function getGoogleOauthClient(prisma: PrismaClient, config: AppConf
   const clientId = typeof secret.meta.clientId === 'string' ? secret.meta.clientId : ''
   if (!clientId) return null
   return { clientId, clientSecret: secret.value }
+}
+
+export interface MicrosoftOauthClient {
+  clientId: string
+  clientSecret: string
+  /** Azure AD directory: 'common' (default), 'organizations', or a tenant ID. */
+  tenant: string
+}
+
+/** The Azure AD app (client ID + secret + tenant) clients sign in through for Outlook. */
+export async function getMicrosoftOauthClient(prisma: PrismaClient, config: AppConfig): Promise<MicrosoftOauthClient | null> {
+  const secret = await getPlatformSecret(prisma, config, 'MICROSOFT_OAUTH_CLIENT')
+  if (!secret) return null
+  const clientId = typeof secret.meta.clientId === 'string' ? secret.meta.clientId : ''
+  if (!clientId) return null
+  const tenant = (typeof secret.meta.tenant === 'string' && secret.meta.tenant.trim()) || 'common'
+  return { clientId, clientSecret: secret.value, tenant }
 }
 
 /** The Claude model the scorer runs — developer-picked, stored on the key's meta. */

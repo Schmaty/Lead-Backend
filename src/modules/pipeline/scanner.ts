@@ -15,15 +15,18 @@ import { upsertPerson } from '../../services/people.js'
 import {
   getAmbientConfig,
   getGoogleOauthClient,
+  getMicrosoftOauthClient,
   getPlatformAnthropicKey,
   getScorerModel,
   getZohoConfig,
   type AmbientConfig,
   type GoogleOauthClient,
+  type MicrosoftOauthClient,
   type ZohoConfig,
 } from '../../services/platformCredentials.js'
 import { resolveSettings, type WorkspaceSettings } from '../../types/settings.js'
 import { googleOauth } from './googleOauth.js'
+import { microsoftOauth } from './microsoftOauth.js'
 import {
   fetchRecentEmails,
   fetchSentEmails,
@@ -33,14 +36,18 @@ import {
 import { classifyRelevance, createAnthropic, scoreEmail, type ConversationContext, type RelevanceVerdict, type ScoredLead } from './scorer.js'
 import { mapCrmStatusToStage } from './stages.js'
 
-/** Client sign-in path: value = Google refresh token, meta = { email, lastScanAt }. */
+/** Client sign-in path (Google): value = Google refresh token, meta = { email, lastScanAt }. */
 export const GMAIL_OAUTH_KIND = 'GMAIL_OAUTH'
+/** Client sign-in path (Microsoft 365): value = MS refresh token, meta = { email, lastScanAt }. */
+export const MICROSOFT_OAUTH_KIND = 'MICROSOFT_OAUTH'
 /** Fallback path (developer-managed): value = app password, meta = { email, host?, port?, lastScanAt }. */
 export const GMAIL_IMAP_KIND = 'GMAIL_IMAP'
 /** Pre-platform installs stored the Anthropic key per workspace; still honored as a fallback. */
 const LEGACY_ANTHROPIC_KIND = 'ANTHROPIC_API_KEY'
 
 const DEFAULT_IMAP_HOST = 'imap.gmail.com'
+/** Outlook / Microsoft 365 IMAP endpoint (OAuth XOAUTH2). */
+const OUTLOOK_IMAP_HOST = 'outlook.office365.com'
 const DEFAULT_IMAP_PORT = 993
 /** Per-scan cap — the cheap gate makes wide coverage affordable. When the cap
  * is hit, the cursor only advances to the newest processed email, so the rest
@@ -163,9 +170,13 @@ export function setScanDepsForTesting(deps: ScanDeps): () => void {
 export interface ScanConfigInfo {
   configured: boolean
   method: 'oauth' | 'imap' | null
+  /** Which sign-in connected the mailbox (null for the app-password fallback or when unconnected). */
+  provider: 'google' | 'microsoft' | null
   email: string | null
   /** True when the developer has stored the platform Google OAuth client. */
   googleSignInAvailable: boolean
+  /** True when the developer has stored the platform Microsoft (Azure AD) OAuth client. */
+  microsoftSignInAvailable: boolean
   /** True when a platform (or legacy workspace) Anthropic key exists. */
   aiReady: boolean
   lastScanAt: Date | null
@@ -173,6 +184,8 @@ export interface ScanConfigInfo {
 
 interface ScanCredentials {
   method: 'oauth' | 'imap'
+  /** For the oauth method: which provider issued the refresh token. */
+  provider?: 'google' | 'microsoft'
   email: string
   host: string
   port: number
@@ -189,6 +202,7 @@ interface ScanCredentials {
   /** oauth method */
   refreshToken?: string
   googleClient?: GoogleOauthClient
+  microsoftClient?: MicrosoftOauthClient
   /** imap method */
   pass?: string
 }
@@ -211,16 +225,19 @@ export async function resolveScanSetup(
   config: AppConfig,
   workspaceId: string,
 ): Promise<{ info: ScanConfigInfo; credentials: ScanCredentials | null }> {
-  const [oauthCred, imapCred, legacyAnthropic, platformKey, googleClient, scorerModel, ambient, zoho] = await Promise.all([
-    prisma.credential.findUnique({ where: { workspaceId_kind: { workspaceId, kind: GMAIL_OAUTH_KIND } } }),
-    prisma.credential.findUnique({ where: { workspaceId_kind: { workspaceId, kind: GMAIL_IMAP_KIND } } }),
-    prisma.credential.findUnique({ where: { workspaceId_kind: { workspaceId, kind: LEGACY_ANTHROPIC_KIND } } }),
-    getPlatformAnthropicKey(prisma, config),
-    getGoogleOauthClient(prisma, config),
-    getScorerModel(prisma, config),
-    getAmbientConfig(prisma, config),
-    getZohoConfig(prisma, config),
-  ])
+  const [oauthCred, msOauthCred, imapCred, legacyAnthropic, platformKey, googleClient, microsoftClient, scorerModel, ambient, zoho] =
+    await Promise.all([
+      prisma.credential.findUnique({ where: { workspaceId_kind: { workspaceId, kind: GMAIL_OAUTH_KIND } } }),
+      prisma.credential.findUnique({ where: { workspaceId_kind: { workspaceId, kind: MICROSOFT_OAUTH_KIND } } }),
+      prisma.credential.findUnique({ where: { workspaceId_kind: { workspaceId, kind: GMAIL_IMAP_KIND } } }),
+      prisma.credential.findUnique({ where: { workspaceId_kind: { workspaceId, kind: LEGACY_ANTHROPIC_KIND } } }),
+      getPlatformAnthropicKey(prisma, config),
+      getGoogleOauthClient(prisma, config),
+      getMicrosoftOauthClient(prisma, config),
+      getScorerModel(prisma, config),
+      getAmbientConfig(prisma, config),
+      getZohoConfig(prisma, config),
+    ])
 
   let anthropicApiKey = platformKey
   if (!anthropicApiKey && legacyAnthropic) {
@@ -232,23 +249,44 @@ export async function resolveScanSetup(
   }
 
   const oauthMeta = (oauthCred?.meta ?? {}) as CredentialMeta
+  const msMeta = (msOauthCred?.meta ?? {}) as CredentialMeta
   const imapMeta = (imapCred?.meta ?? {}) as CredentialMeta
 
+  const googleConnected = !!(oauthCred && oauthMeta.email && googleClient)
+  const microsoftConnected = !!(msOauthCred && msMeta.email && microsoftClient)
+
   let credentials: ScanCredentials | null = null
-  if (oauthCred && oauthMeta.email && googleClient && anthropicApiKey) {
+  if (googleConnected && anthropicApiKey) {
     credentials = {
       method: 'oauth',
-      email: oauthMeta.email,
+      provider: 'google',
+      email: oauthMeta.email!,
       host: DEFAULT_IMAP_HOST,
       port: DEFAULT_IMAP_PORT,
       anthropicApiKey,
       scorerModel,
       ambient,
       zoho,
-      credentialId: oauthCred.id,
+      credentialId: oauthCred!.id,
       lastScanAt: oauthMeta.lastScanAt ? new Date(oauthMeta.lastScanAt) : null,
-      refreshToken: decryptSecret(oauthCred.encryptedValue, config.encryptionKey),
-      googleClient,
+      refreshToken: decryptSecret(oauthCred!.encryptedValue, config.encryptionKey),
+      googleClient: googleClient!,
+    }
+  } else if (microsoftConnected && anthropicApiKey) {
+    credentials = {
+      method: 'oauth',
+      provider: 'microsoft',
+      email: msMeta.email!,
+      host: OUTLOOK_IMAP_HOST,
+      port: DEFAULT_IMAP_PORT,
+      anthropicApiKey,
+      scorerModel,
+      ambient,
+      zoho,
+      credentialId: msOauthCred!.id,
+      lastScanAt: msMeta.lastScanAt ? new Date(msMeta.lastScanAt) : null,
+      refreshToken: decryptSecret(msOauthCred!.encryptedValue, config.encryptionKey),
+      microsoftClient: microsoftClient!,
     }
   } else if (imapCred && imapMeta.email && anthropicApiKey) {
     credentials = {
@@ -266,14 +304,18 @@ export async function resolveScanSetup(
     }
   }
 
-  const connectedMethod = oauthCred && oauthMeta.email && googleClient ? 'oauth' : imapCred && imapMeta.email ? 'imap' : null
-  const connectedMeta = connectedMethod === 'oauth' ? oauthMeta : connectedMethod === 'imap' ? imapMeta : null
+  // What's connected (for the UI), independent of whether AI is ready yet.
+  const connectedProvider: 'google' | 'microsoft' | null = googleConnected ? 'google' : microsoftConnected ? 'microsoft' : null
+  const connectedMethod: 'oauth' | 'imap' | null = connectedProvider ? 'oauth' : imapCred && imapMeta.email ? 'imap' : null
+  const connectedMeta = connectedProvider === 'google' ? oauthMeta : connectedProvider === 'microsoft' ? msMeta : connectedMethod === 'imap' ? imapMeta : null
   return {
     info: {
       configured: credentials !== null,
       method: connectedMethod,
+      provider: connectedProvider,
       email: connectedMeta?.email ?? null,
       googleSignInAvailable: googleClient !== null,
+      microsoftSignInAvailable: microsoftClient !== null,
       aiReady: anthropicApiKey !== null,
       lastScanAt: connectedMeta?.lastScanAt ? new Date(connectedMeta.lastScanAt) : null,
     },
@@ -380,11 +422,19 @@ export async function runScan(
 
     const mailbox: MailboxConfig = { host: credentials.host, port: credentials.port, user: credentials.email }
     if (credentials.method === 'oauth') {
-      mailbox.accessToken = await googleOauth.refreshAccessToken({
-        clientId: credentials.googleClient!.clientId,
-        clientSecret: credentials.googleClient!.clientSecret,
-        refreshToken: credentials.refreshToken!,
-      })
+      mailbox.accessToken =
+        credentials.provider === 'microsoft'
+          ? await microsoftOauth.refreshAccessToken({
+              clientId: credentials.microsoftClient!.clientId,
+              clientSecret: credentials.microsoftClient!.clientSecret,
+              tenant: credentials.microsoftClient!.tenant,
+              refreshToken: credentials.refreshToken!,
+            })
+          : await googleOauth.refreshAccessToken({
+              clientId: credentials.googleClient!.clientId,
+              clientSecret: credentials.googleClient!.clientSecret,
+              refreshToken: credentials.refreshToken!,
+            })
     } else {
       mailbox.pass = credentials.pass
     }

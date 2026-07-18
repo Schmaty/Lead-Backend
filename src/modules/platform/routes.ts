@@ -22,6 +22,9 @@ function validateMeta(kind: string, meta: Record<string, unknown> | undefined): 
   if (kind === 'GOOGLE_OAUTH_CLIENT' && typeof meta?.clientId !== 'string') {
     throw new AppError(400, 'GOOGLE_OAUTH_CLIENT requires meta.clientId (value is the client secret)')
   }
+  if (kind === 'MICROSOFT_OAUTH_CLIENT' && typeof meta?.clientId !== 'string') {
+    throw new AppError(400, 'MICROSOFT_OAUTH_CLIENT requires meta.clientId (value is the client secret; meta.tenant optional)')
+  }
   if (kind === 'ZOHO_CRM' && typeof meta?.clientId !== 'string') {
     throw new AppError(400, 'ZOHO_CRM requires meta.clientId (value is JSON {"clientSecret","refreshToken"})')
   }

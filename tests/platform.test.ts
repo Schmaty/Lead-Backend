@@ -1,7 +1,8 @@
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import type { FastifyInstance } from 'fastify'
-import { signGmailConnectToken } from '../src/auth/tokens.js'
+import { signGmailConnectToken, signMicrosoftConnectToken } from '../src/auth/tokens.js'
 import { setGoogleOauthDepsForTesting } from '../src/modules/pipeline/googleOauth.js'
+import { setMicrosoftOauthDepsForTesting } from '../src/modules/pipeline/microsoftOauth.js'
 import type { InboundEmail, MailboxConfig } from '../src/modules/pipeline/mailbox.js'
 import { runScan, setScanDepsForTesting } from '../src/modules/pipeline/scanner.js'
 import type { ScoredLead } from '../src/modules/pipeline/scorer.js'
@@ -138,7 +139,7 @@ describe('Gmail connect (sign-in) flow', () => {
   it('the callback rejects a bad state token with an error redirect', async () => {
     const res = await app.inject({ method: 'GET', url: '/api/v1/auth/google/callback?code=abc&state=garbage' })
     expect(res.statusCode).toBe(302)
-    expect(res.headers.location).toContain('gmail=error')
+    expect(res.headers.location).toContain('email=error')
   })
 
   it('a valid callback stores the refresh token as GMAIL_OAUTH and redirects to settings', async () => {
@@ -159,7 +160,7 @@ describe('Gmail connect (sign-in) flow', () => {
         url: `/api/v1/auth/google/callback?code=good-code&state=${encodeURIComponent(state)}`,
       })
       expect(res.statusCode).toBe(302)
-      expect(res.headers.location).toContain('gmail=connected')
+      expect(res.headers.location).toContain('email=connected')
     } finally {
       restore()
     }
@@ -206,6 +207,7 @@ describe('Gmail connect (sign-in) flow', () => {
       estPayoutRaw: '$2–4k',
       estWork: '~1 week',
       recommendedNextStep: 'Reply with a call slot.',
+      pipelineStage: 'New',
       draftReply: 'Hi Pat…',
       fitReasons: ['Direct ask'],
       riskFlags: [],
@@ -257,5 +259,126 @@ describe('Gmail connect (sign-in) flow', () => {
     expect(status.json().method).toBeNull()
     // The sign-in stays available for reconnecting.
     expect(status.json().googleSignInAvailable).toBe(true)
+  })
+})
+
+describe('Microsoft 365 connect (sign-in) flow', () => {
+  let msClient: Session
+
+  beforeAll(async () => {
+    msClient = await signup(app, { email: 'owner@msclient.test', workspaceName: 'MS Client Co' })
+    // The developer stores the platform Azure AD app.
+    const missing = await api(app, developer, {
+      method: 'PUT',
+      url: '/api/v1/platform/credentials/MICROSOFT_OAUTH_CLIENT',
+      payload: { value: 'ms-client-secret-1' },
+    })
+    expect(missing.statusCode).toBe(400) // requires meta.clientId
+    const ok = await api(app, developer, {
+      method: 'PUT',
+      url: '/api/v1/platform/credentials/MICROSOFT_OAUTH_CLIENT',
+      payload: { value: 'ms-client-secret-1', meta: { clientId: 'ms-app-id', tenant: 'common' } },
+    })
+    expect(ok.statusCode).toBe(200)
+  })
+
+  it('returns the Microsoft consent URL for OWNER/ADMIN once the platform client exists', async () => {
+    const res = await api(app, msClient, { method: 'POST', url: '/api/v1/workspace/microsoft/connect' })
+    expect(res.statusCode).toBe(200)
+    const url = new URL(res.json().url)
+    expect(url.origin + url.pathname).toBe('https://login.microsoftonline.com/common/oauth2/v2.0/authorize')
+    expect(url.searchParams.get('client_id')).toBe('ms-app-id')
+    expect(url.searchParams.get('redirect_uri')).toBe('http://localhost:5173/api/v1/auth/microsoft/callback')
+    expect(url.searchParams.get('scope')).toContain('https://outlook.office.com/IMAP.AccessAsUser.All')
+    expect(url.searchParams.get('scope')).toContain('offline_access')
+    expect(url.searchParams.get('state')).toBeTruthy()
+  })
+
+  it('a valid callback stores MICROSOFT_OAUTH and status reports the Microsoft provider', async () => {
+    const restore = setMicrosoftOauthDepsForTesting({
+      exchangeCode: async ({ code }) => {
+        expect(code).toBe('ms-code')
+        return { refreshToken: 'ms-refresh-token-1', accessToken: 'ms-at-1', email: 'inbox@msclient.test' }
+      },
+      refreshAccessToken: async () => 'unused',
+    })
+    try {
+      const state = signMicrosoftConnectToken({ workspaceId: msClient.workspace.id, userId: msClient.user.id }, testConfig(ENV))
+      const res = await app.inject({
+        method: 'GET',
+        url: `/api/v1/auth/microsoft/callback?code=ms-code&state=${encodeURIComponent(state)}`,
+      })
+      expect(res.statusCode).toBe(302)
+      expect(res.headers.location).toContain('email=connected')
+    } finally {
+      restore()
+    }
+
+    const row = await app.prisma.credential.findUniqueOrThrow({
+      where: { workspaceId_kind: { workspaceId: msClient.workspace.id, kind: 'MICROSOFT_OAUTH' } },
+    })
+    expect((row.meta as { email: string }).email).toBe('inbox@msclient.test')
+    expect(row.encryptedValue).not.toContain('ms-refresh-token-1')
+
+    const status = await api(app, msClient, { method: 'GET', url: '/api/v1/workspace/scan/status' })
+    expect(status.json()).toMatchObject({
+      configured: true,
+      method: 'oauth',
+      provider: 'microsoft',
+      email: 'inbox@msclient.test',
+      microsoftSignInAvailable: true,
+    })
+  })
+
+  it('the callback rejects a bad state token with an error redirect', async () => {
+    const res = await app.inject({ method: 'GET', url: '/api/v1/auth/microsoft/callback?code=abc&state=garbage' })
+    expect(res.statusCode).toBe(302)
+    expect(res.headers.location).toContain('email=error')
+  })
+
+  it('scans over Outlook OAuth against outlook.office365.com with an XOAUTH2 token', async () => {
+    const seen: MailboxConfig[] = []
+    const email: InboundEmail = {
+      messageId: '<ms-oauth-1@mail.example>',
+      from: { name: 'Robin Vale', address: 'robin@prospect.example' },
+      to: ['inbox@msclient.test'],
+      subject: 'Training inquiry',
+      date: new Date('2026-07-15T09:00:00Z'),
+      text: 'We want an AI workshop for our team.',
+      references: [],
+      inReplyTo: null,
+    }
+    const scored: ScoredLead = {
+      relevant: true, name: 'Robin Vale', org: 'Prospect LLC', inquiryType: 'Other',
+      summary: 'Wants an AI workshop.', fitScore: 7, urgencyScore: 5, leadScore: 7,
+      dealValueLow: 2000, dealValueHigh: 4000, estPayoutRaw: '$2–4k', estWork: '~1 week',
+      recommendedNextStep: 'Reply with a call slot.', pipelineStage: 'New', draftReply: 'Hi Robin…',
+      fitReasons: ['Direct ask'], riskFlags: [], inferredFields: [],
+    }
+    const restoreMs = setMicrosoftOauthDepsForTesting({
+      exchangeCode: async () => { throw new Error('not used here') },
+      refreshAccessToken: async ({ refreshToken, tenant }) => {
+        expect(refreshToken).toBe('ms-refresh-token-1')
+        expect(tenant).toBe('common')
+        return 'ms-short-lived-access-token'
+      },
+    })
+    const restoreScan = setScanDepsForTesting({
+      fetchEmails: async (config) => { seen.push(config); return [email] },
+      fetchSentEmails: async () => [],
+      scoreEmail: async () => scored,
+      listMeetings: async () => [],
+      getMeetingInsight: async () => ({ tldr: '', text: '' }),
+      classifyEmail: async () => ({ decision: 'relevant', confidence: 0.9, reason: 'test' }),
+    })
+    try {
+      await runScan(app.prisma, testConfig(ENV), msClient.workspace.id)
+    } finally {
+      restoreScan()
+      restoreMs()
+    }
+    expect(seen).toHaveLength(1)
+    expect(seen[0]).toMatchObject({ host: 'outlook.office365.com', user: 'inbox@msclient.test', accessToken: 'ms-short-lived-access-token' })
+    expect(seen[0]!.pass).toBeUndefined()
   })
 })

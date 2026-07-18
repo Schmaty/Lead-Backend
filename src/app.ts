@@ -10,7 +10,7 @@ import { registerErrorHandling } from './middleware/errorHandler.js'
 import analyticsRoutes from './modules/analytics/routes.js'
 import ingestRoutes from './modules/ingest/routes.js'
 import leadsRoutes from './modules/leads/routes.js'
-import pipelineRoutes, { googleCallbackRoutes } from './modules/pipeline/routes.js'
+import pipelineRoutes, { googleCallbackRoutes, microsoftCallbackRoutes } from './modules/pipeline/routes.js'
 import platformRoutes from './modules/platform/routes.js'
 import workspaceRoutes from './modules/workspace/routes.js'
 import './types/augment.js'
@@ -81,6 +81,7 @@ export async function buildApp(config: AppConfig): Promise<FastifyInstance> {
 
   await app.register(authRoutes, { prefix: '/api/v1/auth' })
   await app.register(googleCallbackRoutes, { prefix: '/api/v1/auth' })
+  await app.register(microsoftCallbackRoutes, { prefix: '/api/v1/auth' })
   await app.register(workspaceRoutes, { prefix: '/api/v1/workspace' })
   await app.register(pipelineRoutes, { prefix: '/api/v1/workspace' })
   await app.register(platformRoutes, { prefix: '/api/v1/platform' })

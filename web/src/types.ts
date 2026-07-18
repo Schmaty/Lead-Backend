@@ -300,8 +300,10 @@ export interface ScanProgress {
 export interface ScanStatus {
   configured: boolean
   method: 'oauth' | 'imap' | null
+  provider: 'google' | 'microsoft' | null
   email: string | null
   googleSignInAvailable: boolean
+  microsoftSignInAvailable: boolean
   aiReady: boolean
   running: boolean
   progress: ScanProgress | null

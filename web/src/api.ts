@@ -150,6 +150,8 @@ export const api = {
   scanStatus: () => request<ScanStatus>('/workspace/scan/status'),
   /** Start the Google sign-in that connects this workspace's inbox. */
   gmailConnect: () => request<{ url: string }>('/workspace/gmail/connect', { method: 'POST' }),
+  /** Start the Microsoft 365 sign-in that connects this workspace's inbox. */
+  microsoftConnect: () => request<{ url: string }>('/workspace/microsoft/connect', { method: 'POST' }),
 
   // ── platform (developer account only) ───────────────────────────────────
   platformCredentials: () => request<{ credentials: CredentialRow[] }>('/platform/credentials'),

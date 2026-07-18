@@ -29,6 +29,68 @@ function StoredValue({ cred, onRemove }: { cred: CredentialRow; onRemove: () => 
   )
 }
 
+/** Small brand glyph for the provider picker. */
+function ProviderGlyph({ provider }: { provider: 'google' | 'microsoft' }): ReactNode {
+  if (provider === 'microsoft') {
+    return (
+      <svg width="18" height="18" viewBox="0 0 21 21" aria-hidden style={{ flex: '0 0 auto' }}>
+        <rect x="1" y="1" width="9" height="9" fill="#F25022" />
+        <rect x="11" y="1" width="9" height="9" fill="#7FBA00" />
+        <rect x="1" y="11" width="9" height="9" fill="#00A4EF" />
+        <rect x="11" y="11" width="9" height="9" fill="#FFB900" />
+      </svg>
+    )
+  }
+  return (
+    <svg width="18" height="18" viewBox="0 0 48 48" aria-hidden style={{ flex: '0 0 auto' }}>
+      <path fill="#4285F4" d="M45.12 24.5c0-1.56-.14-3.06-.4-4.5H24v8.51h11.84c-.51 2.75-2.06 5.08-4.39 6.64v5.52h7.11c4.16-3.83 6.56-9.47 6.56-16.17z" />
+      <path fill="#34A853" d="M24 46c5.94 0 10.92-1.97 14.56-5.33l-7.11-5.52c-1.97 1.32-4.49 2.1-7.45 2.1-5.73 0-10.58-3.87-12.31-9.07H4.34v5.7A21.99 21.99 0 0 0 24 46z" />
+      <path fill="#FBBC05" d="M11.69 28.18A13.2 13.2 0 0 1 11 24c0-1.45.25-2.86.69-4.18v-5.7H4.34A21.99 21.99 0 0 0 2 24c0 3.55.85 6.91 2.34 9.88l7.35-5.7z" />
+      <path fill="#EA4335" d="M24 10.75c3.23 0 6.13 1.11 8.41 3.29l6.31-6.31C34.91 4.18 29.93 2 24 2 15.4 2 7.96 6.94 4.34 14.12l7.35 5.7c1.73-5.2 6.58-9.07 12.31-9.07z" />
+    </svg>
+  )
+}
+
+function ProviderOption({
+  label,
+  sublabel,
+  available,
+  onClick,
+}: {
+  label: string
+  sublabel: string
+  available: boolean
+  onClick: () => void
+}): ReactNode {
+  const provider = label.startsWith('Microsoft') ? 'microsoft' : 'google'
+  return (
+    <button
+      onClick={available ? onClick : undefined}
+      disabled={!available}
+      className={available ? 'hv-bg' : undefined}
+      style={{
+        display: 'flex',
+        alignItems: 'center',
+        gap: 11,
+        width: '100%',
+        textAlign: 'left',
+        padding: '10px 14px',
+        background: 'transparent',
+        border: 'none',
+        borderTop: `1px solid ${C.line}`,
+        cursor: available ? 'pointer' : 'default',
+        opacity: available ? 1 : 0.55,
+      }}
+    >
+      <ProviderGlyph provider={provider} />
+      <div style={{ minWidth: 0 }}>
+        <div style={{ fontSize: 13, fontWeight: 600 }}>{label}</div>
+        <div style={{ fontSize: 11, color: C.faint }}>{available ? sublabel : 'Not set up by your developer yet'}</div>
+      </div>
+    </button>
+  )
+}
+
 export default function ConnectionTab(): ReactNode {
   const desk = useDesk()
   const { st, set } = desk
@@ -39,6 +101,10 @@ export default function ConnectionTab(): ReactNode {
   const [anthropicKey, setAnthropicKey] = useState('')
   const [googleId, setGoogleId] = useState('')
   const [googleSecret, setGoogleSecret] = useState('')
+  const [msId, setMsId] = useState('')
+  const [msSecret, setMsSecret] = useState('')
+  const [msTenant, setMsTenant] = useState('')
+  const [connectMenuOpen, setConnectMenuOpen] = useState(false)
   const [gmailEmail, setGmailEmail] = useState('')
   const [gmailPass, setGmailPass] = useState('')
   const [webhookSecret, setWebhookSecret] = useState('')
@@ -54,6 +120,7 @@ export default function ConnectionTab(): ReactNode {
   const webhookCred = findCred('N8N_WEBHOOK')
   const anthropicCred = findPlatform('ANTHROPIC_API_KEY')
   const googleCred = findPlatform('GOOGLE_OAUTH_CLIENT')
+  const microsoftCred = findPlatform('MICROSOFT_OAUTH_CLIENT')
   const ambientCred = findPlatform('AMBIENT_API_KEY')
   const zohoCred = findPlatform('ZOHO_CRM')
   const currentModel = typeof anthropicCred?.meta.model === 'string' ? anthropicCred.meta.model : 'claude-opus-4-8'
@@ -97,10 +164,10 @@ export default function ConnectionTab(): ReactNode {
   useEffect(() => {
     void loadStatus()
     void loadPlatform()
-    // Returning from the Google consent screen: #/settings?gmail=connected|error
-    const match = window.location.hash.match(/[?&]gmail=(\w+)/)
+    // Returning from a mailbox consent screen: #/settings?email=connected|error
+    const match = window.location.hash.match(/[?&]email=(\w+)/)
     if (match) {
-      desk.toast(match[1] === 'connected' ? 'Gmail connected — inbox scanning is ready.' : 'Google sign-in didn’t complete — please try again.')
+      desk.toast(match[1] === 'connected' ? 'Inbox connected — scanning is ready.' : 'Email sign-in didn’t complete — please try again.')
       window.history.replaceState(null, '', `${window.location.pathname}#/settings`)
     }
     return () => {
@@ -150,6 +217,7 @@ export default function ConnectionTab(): ReactNode {
   }
 
   const connectGmail = async (): Promise<void> => {
+    setConnectMenuOpen(false)
     try {
       const { url } = await api.gmailConnect()
       window.location.href = url
@@ -158,8 +226,19 @@ export default function ConnectionTab(): ReactNode {
     }
   }
 
+  const connectMicrosoft = async (): Promise<void> => {
+    setConnectMenuOpen(false)
+    try {
+      const { url } = await api.microsoftConnect()
+      window.location.href = url
+    } catch (e) {
+      desk.toast(e instanceof Error ? e.message : 'Could not start Microsoft sign-in')
+    }
+  }
+
   const disconnectMailbox = async (): Promise<void> => {
-    const kind = scan?.method === 'oauth' ? 'GMAIL_OAUTH' : 'GMAIL_IMAP'
+    const kind =
+      scan?.provider === 'microsoft' ? 'MICROSOFT_OAUTH' : scan?.method === 'oauth' ? 'GMAIL_OAUTH' : 'GMAIL_IMAP'
     await desk.removeCredential(kind)
     void loadStatus()
   }
@@ -197,6 +276,7 @@ export default function ConnectionTab(): ReactNode {
   const mailboxConnected = !!scan?.email
   const configured = scan?.configured ?? false
   const callbackUrl = `${window.location.origin}/api/v1/auth/google/callback`
+  const msCallbackUrl = `${window.location.origin}/api/v1/auth/microsoft/callback`
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
@@ -231,7 +311,7 @@ export default function ConnectionTab(): ReactNode {
                     : 'Ready — the first scan reads the last 7 days of mail.'
                   : mailboxConnected && !scan?.aiReady
                     ? 'Mailbox connected. AI scoring isn’t enabled yet — your developer needs to finish platform setup.'
-                    : 'Connect your Gmail inbox below to start.'}
+                    : 'Connect your email inbox below to start.'}
             </div>
             {scan?.running && scan.progress && scan.progress.phase === 'scoring' && scan.progress.total > 0 && (
               <div style={{ height: 4, background: C.bg4, borderRadius: 999, marginTop: 8, overflow: 'hidden' }}>
@@ -246,31 +326,62 @@ export default function ConnectionTab(): ReactNode {
           {mailboxConnected ? (
             <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 10, flexWrap: 'wrap' }}>
               <div style={{ minWidth: 0 }}>
-                <div style={{ fontSize: 13, fontWeight: 600 }}>Gmail — {scan!.email}</div>
+                <div style={{ fontSize: 13, fontWeight: 600 }}>
+                  {scan!.provider === 'microsoft' ? 'Outlook' : 'Gmail'} — {scan!.email}
+                </div>
                 <div style={{ fontSize: 11.5, color: C.faint, marginTop: 1 }}>
-                  {scan!.method === 'oauth' ? 'Connected with Google sign-in.' : 'Connected via app password (developer fallback).'}
+                  {scan!.provider === 'microsoft'
+                    ? 'Connected with Microsoft 365 sign-in.'
+                    : scan!.method === 'oauth'
+                      ? 'Connected with Google sign-in.'
+                      : 'Connected via app password (developer fallback).'}
                 </div>
               </div>
               <button onClick={() => void disconnectMailbox()} style={linkDanger}>Disconnect</button>
             </div>
           ) : (
-            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 10, flexWrap: 'wrap' }}>
-              <div style={{ minWidth: 0 }}>
-                <div style={{ fontSize: 13, fontWeight: 600 }}>Gmail inbox</div>
-                <div style={{ fontSize: 11.5, color: C.faint, marginTop: 1 }}>
-                  {scan?.googleSignInAvailable
-                    ? 'Sign in with the Google account that receives your inquiries. Leadline gets read access to that inbox — nothing else.'
-                    : 'Google sign-in isn’t set up on this deployment yet — ask your developer to finish platform setup.'}
+            (() => {
+              const anyAvailable = !!scan?.googleSignInAvailable || !!scan?.microsoftSignInAvailable
+              return (
+                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 10, flexWrap: 'wrap' }}>
+                  <div style={{ minWidth: 0 }}>
+                    <div style={{ fontSize: 13, fontWeight: 600 }}>Connect your inbox</div>
+                    <div style={{ fontSize: 11.5, color: C.faint, marginTop: 1 }}>
+                      {anyAvailable
+                        ? 'Sign in with the account that receives your inquiries. Leadline gets read access to that inbox — nothing else.'
+                        : 'Email sign-in isn’t set up on this deployment yet — ask your developer to finish platform setup.'}
+                    </div>
+                  </div>
+                  <div style={{ position: 'relative', flex: '0 0 auto' }}>
+                    <button
+                      onClick={() => setConnectMenuOpen((o) => !o)}
+                      disabled={!anyAvailable}
+                      style={{ ...btnSmall, display: 'flex', alignItems: 'center', gap: 7, opacity: anyAvailable ? 1 : 0.5, cursor: anyAvailable ? 'pointer' : 'default' }}
+                    >
+                      Connect email
+                      <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.4" strokeLinecap="round" strokeLinejoin="round" style={{ transform: connectMenuOpen ? 'rotate(180deg)' : 'none', transition: 'transform .15s' }}><path d="m6 9 6 6 6-6" /></svg>
+                    </button>
+                    {connectMenuOpen && anyAvailable && (
+                      <div style={{ position: 'absolute', right: 0, top: 'calc(100% + 6px)', zIndex: 20, minWidth: 232, background: C.bg, border: `1px solid ${C.line}`, borderRadius: 10, boxShadow: '0 10px 30px rgba(0,0,0,.12)', overflow: 'hidden' }}>
+                        <div style={{ fontSize: 10.5, fontWeight: 700, letterSpacing: '.07em', textTransform: 'uppercase', color: C.faint, padding: '10px 14px 6px' }}>Choose your email provider</div>
+                        <ProviderOption
+                          label="Google"
+                          sublabel="Gmail / Google Workspace"
+                          available={!!scan?.googleSignInAvailable}
+                          onClick={() => void connectGmail()}
+                        />
+                        <ProviderOption
+                          label="Microsoft 365"
+                          sublabel="Outlook / Exchange Online"
+                          available={!!scan?.microsoftSignInAvailable}
+                          onClick={() => void connectMicrosoft()}
+                        />
+                      </div>
+                    )}
+                  </div>
                 </div>
-              </div>
-              <button
-                onClick={() => void connectGmail()}
-                disabled={!scan?.googleSignInAvailable}
-                style={{ ...btnSmall, opacity: scan?.googleSignInAvailable ? 1 : 0.5, cursor: scan?.googleSignInAvailable ? 'pointer' : 'default' }}
-              >
-                Sign in with Google
-              </button>
-            </div>
+              )
+            })()
           )}
         </div>
 
@@ -368,6 +479,37 @@ export default function ConnectionTab(): ReactNode {
                   onClick={() => {
                     if (!googleId.trim()) { desk.toast('Enter the OAuth client ID too.'); return }
                     void savePlatform('GOOGLE_OAUTH_CLIENT', googleSecret, { clientId: googleId.trim() }, () => { setGoogleId(''); setGoogleSecret('') })
+                  }}
+                  style={btnSmall}
+                >
+                  Save
+                </button>
+              </div>
+            </div>
+            <div style={credBox}>
+              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 10, flexWrap: 'wrap' }}>
+                <div style={{ minWidth: 0 }}>
+                  <div style={{ fontSize: 13, fontWeight: 600 }}>Microsoft 365 OAuth client</div>
+                  <div style={{ fontSize: 11.5, color: C.faint, marginTop: 1 }}>
+                    The Azure AD app clients sign in through for Outlook. Register redirect URI <span style={{ fontFamily: mono }}>{msCallbackUrl}</span> in the Azure portal, and grant the delegated <span style={{ fontFamily: mono }}>IMAP.AccessAsUser.All</span> + <span style={{ fontFamily: mono }}>offline_access</span> scopes.
+                    {microsoftCred && typeof microsoftCred.meta.clientId === 'string' ? ` Current app: ${microsoftCred.meta.clientId}` : ''}
+                  </div>
+                </div>
+                {microsoftCred && <StoredValue cred={microsoftCred} onRemove={() => void removePlatform('MICROSOFT_OAUTH_CLIENT')} />}
+              </div>
+              <div style={{ display: 'flex', gap: 8, marginTop: 10, flexWrap: 'wrap' }}>
+                <input value={msId} onChange={(e) => setMsId(e.target.value)} placeholder="Application (client) ID" style={{ ...credInput, flex: 2, minWidth: 220 }} />
+                <input value={msSecret} onChange={(e) => setMsSecret(e.target.value)} type="password" placeholder="Client secret value" style={{ ...credInput, flex: 1, minWidth: 160 }} />
+                <input value={msTenant} onChange={(e) => setMsTenant(e.target.value)} placeholder="Tenant (default: common)" style={{ ...credInput, flex: 1, minWidth: 150 }} />
+                <button
+                  onClick={() => {
+                    if (!msId.trim()) { desk.toast('Enter the application (client) ID too.'); return }
+                    void savePlatform(
+                      'MICROSOFT_OAUTH_CLIENT',
+                      msSecret,
+                      { clientId: msId.trim(), ...(msTenant.trim() ? { tenant: msTenant.trim() } : {}) },
+                      () => { setMsId(''); setMsSecret(''); setMsTenant('') },
+                    )
                   }}
                   style={btnSmall}
                 >

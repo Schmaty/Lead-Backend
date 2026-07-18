@@ -75,6 +75,20 @@ export function verifyGmailConnectToken(token: string, config: AppConfig): Gmail
   return { workspaceId: payload.workspaceId as string, userId: payload.userId as string }
 }
 
+/** State token for the Microsoft/Outlook OAuth connect flow (mirror of Gmail's). */
+export function signMicrosoftConnectToken(claims: GmailConnectClaims, config: AppConfig): string {
+  return jwt.sign({ purpose: 'microsoft_connect', workspaceId: claims.workspaceId, userId: claims.userId }, config.jwtAccessSecret, {
+    expiresIn: 600,
+    issuer: ISSUER,
+  })
+}
+
+export function verifyMicrosoftConnectToken(token: string, config: AppConfig): GmailConnectClaims {
+  const payload = jwt.verify(token, config.jwtAccessSecret, { issuer: ISSUER }) as jwt.JwtPayload
+  if (payload.purpose !== 'microsoft_connect') throw new Error('Wrong token purpose')
+  return { workspaceId: payload.workspaceId as string, userId: payload.userId as string }
+}
+
 /**
  * Password-reset tokens embed a fingerprint of the current password hash so a
  * token stops working the moment the password changes (single-use in effect).

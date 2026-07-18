@@ -5,11 +5,17 @@ import { authGuard, requireRole } from '../../middleware/authGuard.js'
 import { AppError } from '../../middleware/errorHandler.js'
 import { workspaceId } from '../../middleware/workspaceScope.js'
 import { audit } from '../../services/audit.js'
-import { getGoogleOauthClient } from '../../services/platformCredentials.js'
+import { getGoogleOauthClient, getMicrosoftOauthClient } from '../../services/platformCredentials.js'
 import { resolveSettings } from '../../types/settings.js'
-import { signGmailConnectToken, verifyGmailConnectToken } from '../../auth/tokens.js'
+import {
+  signGmailConnectToken,
+  verifyGmailConnectToken,
+  signMicrosoftConnectToken,
+  verifyMicrosoftConnectToken,
+} from '../../auth/tokens.js'
 import { buildGoogleAuthUrl, googleOauth, googleRedirectUri } from './googleOauth.js'
-import { getScanState, GMAIL_OAUTH_KIND, resolveScanSetup, runScan } from './scanner.js'
+import { buildMicrosoftAuthUrl, microsoftOauth, microsoftRedirectUri } from './microsoftOauth.js'
+import { getScanState, GMAIL_OAUTH_KIND, MICROSOFT_OAUTH_KIND, resolveScanSetup, runScan } from './scanner.js'
 
 /** Inbox-scanning pipeline: connect, trigger, status. Registered under /workspace. */
 export default async function pipelineRoutes(app: FastifyInstance): Promise<void> {
@@ -30,6 +36,25 @@ export default async function pipelineRoutes(app: FastifyInstance): Promise<void
       url: buildGoogleAuthUrl({
         clientId: client.clientId,
         redirectUri: googleRedirectUri(config.publicUrl),
+        state,
+      }),
+    }
+  })
+
+  // ── Start the Microsoft 365 sign-in that connects this workspace's inbox ──
+  app.post('/microsoft/connect', { preHandler: [guard, adminOnly] }, async (request) => {
+    const auth = request.auth!
+    const wsId = workspaceId(request)
+    const client = await getMicrosoftOauthClient(prisma, config)
+    if (!client) {
+      throw new AppError(400, 'Microsoft sign-in is not set up yet — the developer needs to add the platform Microsoft OAuth client')
+    }
+    const state = signMicrosoftConnectToken({ workspaceId: wsId, userId: auth.userId }, config)
+    return {
+      url: buildMicrosoftAuthUrl({
+        clientId: client.clientId,
+        tenant: client.tenant,
+        redirectUri: microsoftRedirectUri(config.publicUrl),
         state,
       }),
     }
@@ -86,8 +111,10 @@ export default async function pipelineRoutes(app: FastifyInstance): Promise<void
     return {
       configured: info.configured,
       method: info.method,
+      provider: info.provider,
       email: info.email,
       googleSignInAvailable: info.googleSignInAvailable,
+      microsoftSignInAvailable: info.microsoftSignInAvailable,
       aiReady: info.aiReady,
       running: state.running,
       progress: state.running ? (state.progress ?? null) : null,
@@ -110,7 +137,7 @@ export async function googleCallbackRoutes(app: FastifyInstance): Promise<void> 
   app.get('/google/callback', async (request, reply) => {
     const query = request.query as { code?: string; state?: string; error?: string }
     const back = (outcome: string): never => {
-      void reply.redirect(`${config.publicUrl}/#/settings?gmail=${outcome}`)
+      void reply.redirect(`${config.publicUrl}/#/settings?email=${outcome}`)
       return undefined as never
     }
 
@@ -158,10 +185,85 @@ export async function googleCallbackRoutes(app: FastifyInstance): Promise<void> 
       create: { workspaceId: claims.workspaceId, kind: GMAIL_OAUTH_KIND, encryptedValue, meta: meta as Prisma.InputJsonValue },
       update: { encryptedValue, meta: meta as Prisma.InputJsonValue },
     })
+    // One connected mailbox per workspace: switching from Outlook clears it.
+    await prisma.credential.deleteMany({ where: { workspaceId: claims.workspaceId, kind: MICROSOFT_OAUTH_KIND } })
     await audit(prisma, {
       workspaceId: claims.workspaceId,
       userId: claims.userId,
       action: 'gmail.connected',
+      target: exchange.email,
+      ip: request.ip,
+    })
+    return back('connected')
+  })
+}
+
+/**
+ * Microsoft 365 / Outlook OAuth callback — public (Microsoft redirects the
+ * client's browser here; the signed state token ties it back to a workspace).
+ * Registered under /api/v1/auth. Mirror of the Google callback.
+ */
+export async function microsoftCallbackRoutes(app: FastifyInstance): Promise<void> {
+  const { prisma, config } = app
+
+  app.get('/microsoft/callback', async (request, reply) => {
+    const query = request.query as { code?: string; state?: string; error?: string }
+    const back = (outcome: string): never => {
+      void reply.redirect(`${config.publicUrl}/#/settings?email=${outcome}`)
+      return undefined as never
+    }
+
+    if (query.error) return back('error')
+    if (!query.code || !query.state) return back('error')
+
+    let claims
+    try {
+      claims = verifyMicrosoftConnectToken(query.state, config)
+    } catch {
+      return back('error')
+    }
+
+    const client = await getMicrosoftOauthClient(prisma, config)
+    if (!client) return back('error')
+
+    let exchange
+    try {
+      exchange = await microsoftOauth.exchangeCode({
+        clientId: client.clientId,
+        clientSecret: client.clientSecret,
+        tenant: client.tenant,
+        code: query.code,
+        redirectUri: microsoftRedirectUri(config.publicUrl),
+      })
+    } catch (err) {
+      app.log.error({ err }, 'microsoft code exchange failed')
+      return back('error')
+    }
+    if (!exchange.refreshToken || !exchange.email) return back('error')
+
+    // Reconnecting the same mailbox keeps its scan cursor; a new mailbox starts fresh.
+    const existing = await prisma.credential.findUnique({
+      where: { workspaceId_kind: { workspaceId: claims.workspaceId, kind: MICROSOFT_OAUTH_KIND } },
+    })
+    const existingMeta = (existing?.meta ?? {}) as { email?: string; lastScanAt?: string }
+    const meta = {
+      email: exchange.email,
+      ...(existingMeta.email === exchange.email && existingMeta.lastScanAt
+        ? { lastScanAt: existingMeta.lastScanAt }
+        : {}),
+    }
+    const encryptedValue = encryptSecret(exchange.refreshToken, config.encryptionKey)
+    await prisma.credential.upsert({
+      where: { workspaceId_kind: { workspaceId: claims.workspaceId, kind: MICROSOFT_OAUTH_KIND } },
+      create: { workspaceId: claims.workspaceId, kind: MICROSOFT_OAUTH_KIND, encryptedValue, meta: meta as Prisma.InputJsonValue },
+      update: { encryptedValue, meta: meta as Prisma.InputJsonValue },
+    })
+    // One connected mailbox per workspace: switching from Gmail clears it.
+    await prisma.credential.deleteMany({ where: { workspaceId: claims.workspaceId, kind: GMAIL_OAUTH_KIND } })
+    await audit(prisma, {
+      workspaceId: claims.workspaceId,
+      userId: claims.userId,
+      action: 'microsoft.connected',
       target: exchange.email,
       ip: request.ip,
     })
