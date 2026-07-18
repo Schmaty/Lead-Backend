@@ -108,6 +108,9 @@ export default function DetailDrawer(): ReactNode {
                 <span>{lead.email}</span>
                 <span>· {lead.source}</span>
                 <span>· {fmtDate(lead.receivedAt)}</span>
+                {lead.activityDate && fmtDate(lead.activityDate) !== fmtDate(lead.receivedAt) && (
+                  <span title="Activity date detected in the conversation" style={{ color: C.warn }}>· activity {fmtDate(lead.activityDate)}</span>
+                )}
               </div>
             </div>
             <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: 8, flex: '0 0 auto' }}>

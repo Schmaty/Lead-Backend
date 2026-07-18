@@ -85,6 +85,10 @@ model Lead {
   riskFlags                Json            @default("[]")
   inferredFields           Json            @default("[]")
   stage                    String          @default("New")
+  /// True once a human moves the stage — AI re-scores then stop repositioning it.
+  stageOverridden          Boolean         @default(false)
+  /// The real date the deal's activity happened/is scheduled, pulled from the email content (not the arrival time).
+  activityDate             DateTime?
   ownerId                  String?
   owner                    User?           @relation("LeadOwner", fields: [ownerId], references: [id], onDelete: SetNull)
   followUpDate             DateTime?

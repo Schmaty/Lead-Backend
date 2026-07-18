@@ -352,7 +352,30 @@ async function resolveThreadKey(
   email: InboundEmail,
 ): Promise<string> {
   const root = email.references[0] ?? email.inReplyTo
+  // 1. The message continues a thread we already track → stay in it.
+  if (root) {
+    const byRoot = await prisma.lead.findUnique({
+      where: { workspaceId_externalId: { workspaceId, externalId: root } },
+      select: { externalId: true },
+    })
+    if (byRoot?.externalId) return byRoot.externalId
+  }
+  // 2. The sender already has a lead (email-scanned OR CRM-imported) → fold this
+  //    message into it, so new mail updates that lead's stage / summary / score.
+  const known = await prisma.lead.findFirst({
+    where: {
+      workspaceId,
+      deletedAt: null,
+      externalId: { not: null },
+      OR: [{ email: email.from.address }, { people: { some: { email: email.from.address } } }],
+    },
+    orderBy: { lastTouchedAt: 'desc' },
+    select: { externalId: true },
+  })
+  if (known?.externalId) return known.externalId
+  // 3. A new thread from an unknown sender keeps its thread root as identity.
   if (root) return root
+  // 4. A "Re:"-style reply with no References — match by subject to a known lead.
   if (isReplySubject(email.subject)) {
     const candidates = await prisma.lead.findMany({
       where: { workspaceId, deletedAt: null, email: email.from.address, externalId: { not: null } },
@@ -366,6 +389,7 @@ async function resolveThreadKey(
     )
     if (match?.externalId) return match.externalId
   }
+  // 5. Stands alone — its own Message-ID starts a new conversation.
   return email.messageId
 }
 
@@ -640,8 +664,10 @@ export async function runScan(
             riskFlags: scored.riskFlags,
             inferredFields: scored.inferredFields,
             threads: group.map((email) => asThread(email, 'in')),
-            // Land the lead where the conversation actually is (create only).
+            // Land the lead where the conversation actually is; on merge this
+            // repositions it (unless a human pinned the stage).
             initialStage: scored.pipelineStage,
+            activityDate: scored.activityDate ? new Date(scored.activityDate) : null,
             createdDetail:
               scored.pipelineStage === settings.stages[0]
                 ? `Scanned from inbox (${newest.from.address})`
@@ -788,6 +814,7 @@ export async function runScan(
                 inferredFields: scored.inferredFields,
                 threads: [],
                 initialStage,
+                activityDate: scored.activityDate ? new Date(scored.activityDate) : null,
                 createdDetail: `Imported from Zoho CRM (${open.record.name})${
                   open.status ? ` · status "${open.status}" → ${initialStage}` : ` · stage ${initialStage}`
                 }`,

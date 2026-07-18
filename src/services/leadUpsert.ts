@@ -32,8 +32,15 @@ export interface UpsertLeadInput {
   riskFlags: string[]
   inferredFields: string[]
   threads: UpsertThread[]
-  /** Stage for first insert only (updates never touch the human-owned stage). */
+  /**
+   * The stage the AI/CRM believes the deal is at. Used verbatim on insert, and
+   * on merge it repositions the lead — UNLESS a human has pinned the stage
+   * (stageOverridden). This is how new emails update a CRM-imported lead's
+   * pipeline position.
+   */
   initialStage: string
+  /** The deal's real activity date (from the email content), if any. */
+  activityDate?: Date | null
   /** Detail line for the `created` timeline event. */
   createdDetail: string
 }
@@ -119,6 +126,7 @@ export async function upsertLeadByExternalId(
             ...aiFields,
             ...computed,
             stage: input.initialStage,
+            activityDate: input.activityDate ?? null,
             lastTouchedAt: newestThreadAt,
             threads: { create: threadRows },
             timeline: {
@@ -167,11 +175,18 @@ export async function upsertLeadByExternalId(
         addedThreads = threadRows.length
       }
 
+      // New activity can reposition the deal in the pipeline — but a human's
+      // manual stage move (stageOverridden) is final and never auto-changed.
+      const reposition =
+        !existing.stageOverridden && settings.stages.includes(input.initialStage) && input.initialStage !== existing.stage
+
       const lead = await tx.lead.update({
         where: { id: existing.id },
         data: {
           ...aiFields,
           ...computed,
+          ...(reposition ? { stage: input.initialStage } : {}),
+          ...(input.activityDate != null ? { activityDate: input.activityDate } : {}),
           // Replace mode: the sender owns receivedAt. Merge mode: first contact stays.
           ...(threadMode === 'replace' ? { receivedAt: input.receivedAt } : {}),
           ...(threadMode === 'merge' && addedThreads > 0 && newestThreadAt > existing.lastTouchedAt
@@ -179,6 +194,11 @@ export async function upsertLeadByExternalId(
             : {}),
         },
       })
+      if (reposition) {
+        await tx.timelineEvent.create({
+          data: { leadId: existing.id, type: 'stage_change', actor: 'system', detail: `${existing.stage} → ${input.initialStage} — from new activity` },
+        })
+      }
       return { lead, created: false, addedThreads }
     })
 

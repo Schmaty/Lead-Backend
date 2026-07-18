@@ -334,6 +334,8 @@ export default async function leadsRoutes(app: FastifyInstance): Promise<void> {
         throw new AppError(400, `Unknown stage "${body.stage}"`, { allowedStages: settings.stages })
       }
       data.stage = body.stage
+      // A human move pins the stage: AI re-scores won't reposition it afterwards.
+      data.stageOverridden = true
       events.push({ type: 'stage_change', detail: `${lead.stage} → ${body.stage}` })
     }
 

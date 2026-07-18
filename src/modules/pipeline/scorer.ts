@@ -32,7 +32,12 @@ const scoredLeadSchema = z.object({
   pipelineStage: z
     .string()
     .describe(
-      'The pipeline stage this deal has ACTUALLY reached, judged from the evidence — one of the workspace stages, verbatim. Start at the first stage for a fresh first-touch inquiry with no reply yet; advance only on concrete evidence (a reply exchanged, a call/meeting held, needs qualified, a proposal/quote sent, a deal explicitly won or lost). Never advance on optimism, and never pick a won stage unless the text confirms a signed/agreed deal.',
+      'The pipeline stage this deal has ACTUALLY reached, judged from the evidence — one of the workspace stages, verbatim. Start at the first stage for a fresh first-touch inquiry with no reply yet; advance only on concrete evidence (a reply exchanged, a call/meeting held, needs qualified, a proposal/quote sent, a deal explicitly won or lost). Never advance on optimism, and never pick a won stage unless the text confirms a signed/agreed deal. If the message describes an engagement that already happened weeks or months ago, do NOT use the first stage — place it where the deal actually ended up (often a closed stage for something already delivered).',
+    ),
+  activityDate: z
+    .string()
+    .describe(
+      "The date the described activity actually happened or is scheduled (a workshop date, a call, 'last March', 'next week') as an ISO date YYYY-MM-DD — your best estimate. Empty string if the message states no such date. This is the DEAL's real timeline, not when the email arrived.",
     ),
   draftReply: z.string().describe('A short, warm, specific reply draft the team could send. No placeholder brackets; sign off without a name.'),
   fitReasons: z.array(z.string()).describe('Short bullets for why this lead fits (empty if it does not)'),
@@ -63,6 +68,7 @@ function buildSystemPrompt(settings: WorkspaceSettings, workspaceName: string): 
     'Read the email and produce a structured lead assessment. Judge fit from the perspective of the business receiving the email.',
     `The inquiry categories are, verbatim: ${settings.inquiryTypes.map((t) => `"${t}"`).join(', ')}. Pick exactly one.`,
     `The pipeline stages, earliest → latest, are: ${settings.stages.map((s) => `"${s}"`).join(', ')}. For pipelineStage, pick the one that matches how far this deal has actually progressed, using the evidence in front of you — default to the first stage unless there is clear evidence of progress.`,
+    'Read the dates and time references in the message. The email\'s arrival time is separate from the deal\'s real timeline — extract the latter into activityDate. If the substance describes something that already happened weeks or months ago (a workshop delivered, a call already held), this is NOT a fresh new lead: do not use the first pipeline stage, keep urgencyScore low (0-2), and let leadScore reflect that it is not an actionable live opportunity. A recent timestamp on old news must never make a lead hot or "new".',
     'Scores are integers 0-10. Deal values are USD estimates for the full engagement; use 0/0 when the email gives no basis for a number.',
     'Anything you estimate without direct evidence in the email belongs in inferredFields.',
     'Mark relevant=false for anything that is not a genuine potential-client inquiry (newsletters, receipts, automated mail, spam, vendors selling TO the business). Still fill in the other fields as best you can.',
@@ -127,6 +133,14 @@ export async function scoreEmail(
   return normalizeScoredLead(parsed, settings)
 }
 
+/** Keep only a clean YYYY-MM-DD the DB can store; drop anything unparseable. */
+export function normalizeActivityDate(raw: string): string {
+  const trimmed = (raw ?? '').trim()
+  if (!/^\d{4}-\d{2}-\d{2}/.test(trimmed)) return ''
+  const date = new Date(trimmed.slice(0, 10))
+  return Number.isNaN(date.getTime()) ? '' : trimmed.slice(0, 10)
+}
+
 /** Clamp model output onto workspace vocabulary (exported for tests). */
 export function normalizeScoredLead(raw: ScoredLead, settings: WorkspaceSettings): ScoredLead {
   const inquiryType = settings.inquiryTypes.includes(raw.inquiryType)
@@ -143,6 +157,7 @@ export function normalizeScoredLead(raw: ScoredLead, settings: WorkspaceSettings
     ...raw,
     inquiryType,
     pipelineStage: normalizeStage(raw.pipelineStage, settings),
+    activityDate: normalizeActivityDate(raw.activityDate),
     fitScore: clamp(raw.fitScore),
     urgencyScore: clamp(raw.urgencyScore),
     leadScore: clamp(raw.leadScore),

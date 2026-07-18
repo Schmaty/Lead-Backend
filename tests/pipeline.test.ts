@@ -2,7 +2,7 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import type { FastifyInstance } from 'fastify'
 import type { InboundEmail, MailboxConfig } from '../src/modules/pipeline/mailbox.js'
 import { runScan, setScanDepsForTesting, type ScanDeps } from '../src/modules/pipeline/scanner.js'
-import { normalizeScoredLead, type ConversationContext, type RelevanceVerdict, type ScoredLead } from '../src/modules/pipeline/scorer.js'
+import { normalizeActivityDate, normalizeScoredLead, type ConversationContext, type RelevanceVerdict, type ScoredLead } from '../src/modules/pipeline/scorer.js'
 import { mapCrmStatusToStage, normalizeStage } from '../src/modules/pipeline/stages.js'
 import type { AmbientInsight, AmbientMeeting } from '../src/services/ambient.js'
 import { DEFAULT_SETTINGS } from '../src/types/settings.js'
@@ -293,12 +293,45 @@ describe('runScan', () => {
     const detail = await api(app, owner, { method: 'GET', url: `/api/v1/leads/${lead.id}` })
     expect(detail.json().timeline[0].detail).toContain('detected stage: Qualified')
   })
+
+  it('new activity repositions an un-pinned lead as the conversation progresses', async () => {
+    const first = email({ messageId: '<rep-1@mail.example>', from: { name: 'Nadia Or', address: 'nadia@fresh.example' }, subject: 'Enablement program', text: 'Exploring an AI enablement program.' })
+    const second = email({
+      messageId: '<rep-2@mail.example>',
+      from: { name: 'Nadia Or', address: 'nadia@fresh.example' },
+      subject: 'Re: Enablement program',
+      text: 'Thanks for the proposal — reviewing it with the team.',
+      references: ['<rep-1@mail.example>'],
+      inReplyTo: '<rep-1@mail.example>',
+    })
+    scoredFor[first.messageId] = { ...scoredFor[hotEmail.messageId]!, name: 'Nadia Or', org: 'Freshco', pipelineStage: 'New' }
+    scoredFor[second.messageId] = { ...scoredFor[first.messageId]!, summary: 'Proposal under review.', pipelineStage: 'Proposal sent' }
+
+    await runScan(app.prisma, testConfig(), owner.workspace.id, fakeDeps([first]))
+    let list = await api(app, owner, { method: 'GET', url: '/api/v1/leads?pageSize=50' })
+    let lead = list.json().items.find((l: { externalId: string }) => l.externalId === first.messageId)
+    expect(lead.stage).toBe('New')
+
+    const merge = await runScan(app.prisma, testConfig(), owner.workspace.id, fakeDeps([second]))
+    expect(merge.merged).toBe(1)
+    list = await api(app, owner, { method: 'GET', url: '/api/v1/leads?pageSize=50' })
+    lead = list.json().items.find((l: { externalId: string }) => l.externalId === first.messageId)
+    expect(lead.stage).toBe('Proposal sent') // repositioned by the new email
+    const detail = await api(app, owner, { method: 'GET', url: `/api/v1/leads/${lead.id}` })
+    expect(detail.json().timeline.some((e: { detail: string }) => e.detail.includes('from new activity'))).toBe(true)
+  })
 })
 
 describe('scan route flow', () => {
   it('reports live per-email progress while a scan runs', async () => {
+    // Two fresh conversations (unknown senders) so both go through the slow
+    // scorer — the observable "scoring" phase this test checks for.
+    const slowA = email({ messageId: '<slow-a@mail.example>', from: { name: 'Slow A', address: 'a@slowprog.example' }, subject: 'Workshop question A' })
+    const slowB = email({ messageId: '<slow-b@mail.example>', from: { name: 'Slow B', address: 'b@slowprog.example' }, subject: 'Workshop question B' })
+    scoredFor[slowA.messageId] = { ...scoredFor[spamEmail.messageId]! }
+    scoredFor[slowB.messageId] = { ...scoredFor[spamEmail.messageId]! }
     const slowDeps: ScanDeps = {
-      fetchEmails: async () => [hotEmail, spamEmail],
+      fetchEmails: async () => [slowA, slowB],
       fetchSentEmails: async () => [],
       scoreEmail: async (_key, email) => {
         await new Promise((resolve) => setTimeout(resolve, 250))
@@ -474,7 +507,8 @@ describe('conversation merging & progress tracking', () => {
     expect(detail.threads).toHaveLength(3)
   })
 
-  it('a fresh subject from a known sender starts a new lead, not a merge', async () => {
+  it('a fresh email from a known sender merges into their existing lead and re-scores it', async () => {
+    const before = (await api(app, owner, { method: 'GET', url: '/api/v1/leads?pageSize=50' })).json().total
     const fresh = email({
       messageId: '<dana-new-1@mail.example>',
       from: { name: 'Dana Okafor', address: 'dana@northwind.example' },
@@ -484,8 +518,17 @@ describe('conversation merging & progress tracking', () => {
     })
     scoredFor[fresh.messageId] = { ...scoredFor[hotEmail.messageId]!, summary: 'Asks about 1:1 exec coaching.' }
     const result = await runScan(app.prisma, testConfig(), owner.workspace.id, fakeDeps([fresh]))
-    expect(result.imported).toBe(1)
-    expect(result.merged).toBe(0)
+    // Known contact → folds into their existing lead, not a new one.
+    expect(result.imported).toBe(0)
+    expect(result.merged).toBe(1)
+    const list = await api(app, owner, { method: 'GET', url: '/api/v1/leads?pageSize=50' })
+    expect(list.json().total).toBe(before)
+    const hot = list.json().items.find((l: { externalId: string }) => l.externalId === hotEmail.messageId)
+    const detail = (await api(app, owner, { method: 'GET', url: `/api/v1/leads/${hot.id}` })).json()
+    expect(detail.summary).toContain('coaching') // re-scored from the new email
+    expect(detail.threads.some((t: { subject: string }) => t.subject === 'Different question about coaching')).toBe(true)
+    // The human-set stage stays pinned through the merge.
+    expect(detail.stage).toBe('Contacted')
   })
 
   it('sent mail attaches as an outbound reply: replySent, timeline, and stage advance', async () => {
@@ -661,6 +704,14 @@ describe('pipeline stage categorization', () => {
     expect(normalizeStage('not a fit', DEFAULT_SETTINGS)).toBe('Not fit')
     expect(normalizeStage(undefined, DEFAULT_SETTINGS)).toBe('New')
     expect(normalizeStage('nonsense', DEFAULT_SETTINGS)).toBe('New')
+  })
+
+  it('normalizeActivityDate keeps clean ISO dates and drops the rest', () => {
+    expect(normalizeActivityDate('2026-03-15')).toBe('2026-03-15')
+    expect(normalizeActivityDate('2026-03-15T10:00:00Z')).toBe('2026-03-15')
+    expect(normalizeActivityDate('last March')).toBe('')
+    expect(normalizeActivityDate('')).toBe('')
+    expect(normalizeActivityDate('2026-13-99')).toBe('')
   })
 
   it('maps Zoho Lead_Status to the stage the deal has reached', () => {

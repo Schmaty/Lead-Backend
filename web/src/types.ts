@@ -127,6 +127,9 @@ export interface Lead {
   riskFlags: string[]
   inferredFields: string[]
   stage: string
+  stageOverridden?: boolean
+  /** The deal's real activity date pulled from the email content (may differ from receivedAt). */
+  activityDate?: string | null
   ownerId: string | null
   owner?: { id: string; name: string } | null
   followUpDate: string | null

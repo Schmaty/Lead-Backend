@@ -37,6 +37,8 @@ export function serializeLead(lead: LeadWithRelations): Record<string, unknown> 
     riskFlags: lead.riskFlags,
     inferredFields: lead.inferredFields,
     stage: lead.stage,
+    stageOverridden: lead.stageOverridden,
+    activityDate: lead.activityDate,
     ownerId: lead.ownerId,
     followUpDate: lead.followUpDate,
     replySent: lead.replySent,
