@@ -68,13 +68,28 @@ export interface CrmRecord {
   email: string
   phone: string
   url: string
+  /** How the record was matched: exact email, or AI keyword search. */
+  matchVia?: 'email' | 'ai'
+  /** 0..1 confidence when AI-matched. */
+  matchConfidence?: number
 }
 
 export interface CrmLookup {
   available: boolean
   records: CrmRecord[]
   checkedAt: string | null
-  push: { comingSoon: boolean }
+  /** Zoho's new-lead form URL — the prefill fallback when a record doesn't exist yet. */
+  createUrl: string | null
+}
+
+export interface CrmPushResult {
+  ok: boolean
+  id?: string
+  url?: string
+  /** True when the Zoho token is read-only — fall back to the prefilled form. */
+  scopeError?: boolean
+  error?: string
+  createUrl?: string
 }
 
 export interface TimelineEvent {

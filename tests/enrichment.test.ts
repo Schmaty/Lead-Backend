@@ -5,6 +5,8 @@ import { runScan, type ScanDeps } from '../src/modules/pipeline/scanner.js'
 import type { ConversationContext, ScoredLead } from '../src/modules/pipeline/scorer.js'
 import type { AmbientInsight, AmbientMeeting } from '../src/services/ambient.js'
 import { clearZohoTokenCacheForTesting, setZohoDepsForTesting } from '../src/services/zoho.js'
+import { aiMatchCrm } from '../src/services/crmMatch.js'
+import type { ZohoConfig } from '../src/services/platformCredentials.js'
 import { api, makeApp, resetDb, signup, testConfig, type Session } from './helpers.js'
 
 const OWNER_EMAIL = 'owner@enrich.test'
@@ -259,7 +261,7 @@ describe('Zoho CRM', () => {
     const detail = await leadDetail()
     const res = await api(app, owner, { method: 'GET', url: `/api/v1/leads/${detail.id}/crm` })
     expect(res.statusCode).toBe(200)
-    expect(res.json()).toMatchObject({ available: false, records: [], push: { comingSoon: true } })
+    expect(res.json()).toMatchObject({ available: false, records: [], createUrl: null })
   })
 
   it('requires meta.clientId on the ZOHO_CRM credential', async () => {
@@ -385,10 +387,96 @@ describe('Zoho CRM', () => {
     expect(again.imported).toBe(0)
   })
 
-  it('push to CRM is built but gated: 501 coming soon', async () => {
-    const detail = await leadDetail()
-    const res = await api(app, owner, { method: 'POST', url: `/api/v1/leads/${detail.id}/crm/push` })
-    expect(res.statusCode).toBe(501)
-    expect(res.json().comingSoon).toBe(true)
+  it('pushes a lead to Zoho as a new record with a write-scoped token', async () => {
+    clearZohoTokenCacheForTesting()
+    let posted: unknown = null
+    const restore = setZohoDepsForTesting({
+      async fetchJson(url, init) {
+        if (url.includes('/oauth/v2/token')) return { status: 200, json: { access_token: 'zoho-write-1', expires_in: 3600 } }
+        if (url.endsWith('/crm/v8/Leads') && init.method === 'POST') {
+          posted = JSON.parse(init.body ?? '{}')
+          return { status: 201, json: { data: [{ code: 'SUCCESS', details: { id: 'z-777' }, status: 'success' }] } }
+        }
+        return { status: 204, json: null }
+      },
+    })
+    try {
+      const detail = await leadDetail()
+      const res = await api(app, owner, { method: 'POST', url: `/api/v1/leads/${detail.id}/crm/push` })
+      expect(res.statusCode).toBe(201)
+      expect(res.json()).toMatchObject({ ok: true, id: 'z-777', url: 'https://crm.zoho.com/crm/tab/Leads/z-777' })
+      // Zoho's only hard-required Leads field is present.
+      expect((posted as { data: Array<{ Last_Name: string }> }).data[0].Last_Name).toBeTruthy()
+      const after = await leadDetail()
+      expect(after.crmRecords.some((r: { id: string }) => r.id === 'z-777')).toBe(true)
+      expect(after.timeline.some((e: { type: string }) => e.type === 'crm_push')).toBe(true)
+    } finally {
+      restore()
+    }
+  })
+
+  it('a read-only Zoho token fails the push gracefully (scopeError + form fallback)', async () => {
+    clearZohoTokenCacheForTesting()
+    const restore = setZohoDepsForTesting({
+      async fetchJson(url) {
+        if (url.includes('/oauth/v2/token')) return { status: 200, json: { access_token: 'zoho-ro-1', expires_in: 3600 } }
+        if (url.endsWith('/crm/v8/Leads')) return { status: 202, json: { data: [{ code: 'OAUTH_SCOPE_MISMATCH', status: 'error' }] } }
+        return { status: 204, json: null }
+      },
+    })
+    try {
+      const detail = await leadDetail()
+      const res = await api(app, owner, { method: 'POST', url: `/api/v1/leads/${detail.id}/crm/push` })
+      expect(res.statusCode).toBe(200)
+      expect(res.json()).toMatchObject({ ok: false, scopeError: true })
+      expect(res.json().createUrl).toContain('/crm/tab/Leads/create')
+    } finally {
+      restore()
+    }
+  })
+
+  it('AI keyword matcher finds a record when the exact email does not match', async () => {
+    clearZohoTokenCacheForTesting()
+    const searchedWords: string[] = []
+    const restore = setZohoDepsForTesting({
+      async fetchJson(url) {
+        if (url.includes('/oauth/v2/token')) return { status: 200, json: { access_token: 'zoho-ai-1', expires_in: 3600 } }
+        const m = url.match(/[?&]word=([^&]+)/)
+        if (m) {
+          searchedWords.push(decodeURIComponent(m[1]!))
+          if (url.includes('/Leads/search')) {
+            return { status: 200, json: { data: [{ id: 'z-900', First_Name: 'Dana', Last_Name: 'Okafor', Email: 'dana@northwind.example', Company: 'Northwind Logistics' }] } }
+          }
+        }
+        return { status: 204, json: null } // no email match, no Contacts match
+      },
+    })
+    // Cheapest-model calls, faked: first returns keywords, second picks the match.
+    let call = 0
+    const fakeAnthropic = {
+      messages: {
+        parse: async () => {
+          call += 1
+          return call === 1
+            ? { parsed_output: { terms: ['Northwind Logistics'] } }
+            : { parsed_output: { matchIndex: 0, confidence: 0.9, reason: 'Same company and person' } }
+        },
+      },
+    }
+    const zoho: ZohoConfig = {
+      clientId: 'c', clientSecret: 's', refreshToken: 'r',
+      accountsUrl: 'https://accounts.zoho.com', apiDomain: 'https://www.zohoapis.com',
+    }
+    try {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const records = await aiMatchCrm(fakeAnthropic as any, zoho, {
+        name: 'Dana Okafor', email: 'dana.okafor@gmail.com', org: 'Northwind Logistics', summary: 'Wants a workshop.', people: [],
+      })
+      expect(records).toHaveLength(1)
+      expect(records[0]).toMatchObject({ id: 'z-900', matchVia: 'ai', matchConfidence: 0.9 })
+      expect(searchedWords).toContain('Northwind Logistics')
+    } finally {
+      restore()
+    }
   })
 })

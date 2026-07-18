@@ -5,9 +5,10 @@ import { AppError } from '../../middleware/errorHandler.js'
 import { workspaceId } from '../../middleware/workspaceScope.js'
 import { audit } from '../../services/audit.js'
 import { applyComputed, computeExpectedValue } from '../../services/leadCompute.js'
-import { getZohoConfig } from '../../services/platformCredentials.js'
+import { getPlatformAnthropicKey, getZohoConfig } from '../../services/platformCredentials.js'
 import { syncLeadCrm } from '../../services/crmSync.js'
-import { CRM_PUSH_ENABLED } from '../../services/zoho.js'
+import { createAnthropic } from '../../modules/pipeline/scorer.js'
+import { createCrmLead, crmCreateLeadUrl } from '../../services/zoho.js'
 import { resolveSettings, type WorkspaceSettings } from '../../types/settings.js'
 import { buildLeadWhere, computeAggregates } from './query.js'
 import {
@@ -157,13 +158,14 @@ export default async function leadsRoutes(app: FastifyInstance): Promise<void> {
     if (!lead) throw new AppError(404, 'Lead not found')
     const zoho = await getZohoConfig(prisma, config)
     if (!zoho) {
-      return { available: false, records: [], checkedAt: null, push: { comingSoon: true } }
+      return { available: false, records: [], checkedAt: null, createUrl: null }
     }
     try {
       // Same pull the scan runs: caches on the lead, logs new matches,
-      // backfills org + person phones.
-      const { records } = await syncLeadCrm(prisma, zoho, lead.id)
-      return { available: true, records, checkedAt: new Date(), push: { comingSoon: true } }
+      // backfills org + person phones. Exact email first, then AI keywords.
+      const apiKey = await getPlatformAnthropicKey(prisma, config)
+      const { records } = await syncLeadCrm(prisma, zoho, lead.id, apiKey ? { anthropic: createAnthropic(apiKey) } : {})
+      return { available: true, records, checkedAt: new Date(), createUrl: crmCreateLeadUrl() }
     } catch (err) {
       app.log.error({ err, leadId: id }, 'zoho lookup failed')
       throw new AppError(502, 'CRM lookup failed — check the Zoho connection')
@@ -171,14 +173,74 @@ export default async function leadsRoutes(app: FastifyInstance): Promise<void> {
   })
 
   /**
-   * Push-to-CRM is built but deliberately gated: the platform Zoho tokens are
-   * read-only today. Ships once a WRITE-scoped token is connected.
+   * Push this lead into Zoho as a new Lead. Needs a WRITE-scoped Zoho token; the
+   * default read-only connection returns 200 { ok:false, scopeError:true } with
+   * the create-form URL so the UI can fall back to the prefilled Zoho form.
    */
-  app.post('/:id/crm/push', { preHandler: [guard] }, async (request, reply) => {
-    if (!CRM_PUSH_ENABLED) {
-      return reply.status(501).send({ error: 'Pushing to Zoho CRM is coming soon', comingSoon: true })
+  app.post('/:id/crm/push', { preHandler: [guard, requireRole('OWNER', 'ADMIN')] }, async (request, reply) => {
+    const auth = request.auth!
+    const wsId = workspaceId(request)
+    const { id } = request.params as { id: string }
+    const lead = await prisma.lead.findFirst({
+      where: { id, workspaceId: wsId, deletedAt: null },
+      include: { people: true },
+    })
+    if (!lead) throw new AppError(404, 'Lead not found')
+    const zoho = await getZohoConfig(prisma, config)
+    if (!zoho) throw new AppError(400, 'Zoho CRM isn’t connected — add it under Settings → Platform')
+
+    const [first, ...rest] = (lead.name || '').trim().split(/\s+/).filter(Boolean)
+    const phone = lead.people.find((p) => p.phone)?.phone ?? ''
+    const value = lead.estPayoutRaw || (lead.dealValueHigh ? `$${lead.dealValueLow}–${lead.dealValueHigh}` : '')
+    const description = [
+      lead.summary,
+      value ? `Estimated value: ${value}` : '',
+      lead.inquiryType ? `Inquiry: ${lead.inquiryType}` : '',
+      `Lead score: ${lead.leadScore}/10 · stage: ${lead.stage}`,
+      lead.recommendedNextStep ? `Next step: ${lead.recommendedNextStep}` : '',
+      'Added from Leadline.',
+    ].filter(Boolean).join('\n')
+
+    const result = await createCrmLead(zoho, {
+      firstName: rest.length ? first ?? '' : '',
+      lastName: rest.length ? rest.join(' ') : first ?? '',
+      email: lead.email,
+      company: lead.org,
+      phone,
+      description,
+    })
+
+    if (!result.ok) {
+      return reply.status(result.scopeError ? 200 : 502).send({
+        ok: false,
+        scopeError: result.scopeError,
+        error: result.message,
+        createUrl: crmCreateLeadUrl(),
+      })
     }
-    return reply.status(501).send({ error: 'Pushing to Zoho CRM is coming soon', comingSoon: true })
+
+    const record = {
+      module: 'Leads' as const,
+      id: result.id,
+      name: lead.name,
+      company: lead.org,
+      email: lead.email,
+      phone,
+      url: result.url,
+      matchVia: 'email' as const,
+    }
+    const existing = (lead.crmRecords ?? []) as Array<{ module?: string; id?: string }>
+    await prisma.$transaction([
+      prisma.lead.update({
+        where: { id: lead.id },
+        data: { crmRecords: [...existing, record] as unknown as Prisma.InputJsonValue, crmCheckedAt: new Date() },
+      }),
+      prisma.timelineEvent.create({
+        data: { leadId: lead.id, type: 'crm_push', actor: auth.name, detail: `Pushed to Zoho CRM as a new lead — ${lead.name}` },
+      }),
+    ])
+    await audit(prisma, { workspaceId: wsId, userId: auth.userId, action: 'lead.crm_pushed', target: result.id, ip: request.ip })
+    return reply.status(201).send({ ok: true, id: result.id, url: result.url })
   })
 
   // ── Manual add ─────────────────────────────────────────────────────────────

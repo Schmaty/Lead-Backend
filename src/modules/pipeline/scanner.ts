@@ -816,9 +816,11 @@ export async function runScan(
           take: 10,
           select: { id: true },
         })
+        // The cheap keyword matcher backs up the exact-email lookup.
+        const crmAnthropic = createAnthropic(credentials.anthropicApiKey)
         for (const leadId of [...touchedLeadIds, ...stale.map((row) => row.id)]) {
           try {
-            const { newMatches } = await syncLeadCrm(prisma, credentials.zoho, leadId)
+            const { newMatches } = await syncLeadCrm(prisma, credentials.zoho, leadId, { anthropic: crmAnthropic })
             if (newMatches > 0) {
               result.crm++
               progress.crm++
