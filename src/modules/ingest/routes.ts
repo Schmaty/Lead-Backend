@@ -5,6 +5,7 @@ import { apiKeyGuard } from '../../middleware/apiKeyGuard.js'
 import { upsertLeadByExternalId } from '../../services/leadUpsert.js'
 import { resolveSettings } from '../../types/settings.js'
 import { isoDate } from '../leads/schemas.js'
+import { normalizeStage } from '../pipeline/stages.js'
 
 const score = z.number().int().min(0).max(10)
 
@@ -26,6 +27,8 @@ export const ingestLeadSchema = z.object({
   estPayoutRaw: z.string().max(1000).default(''),
   estWork: z.string().max(1000).default(''),
   recommendedNextStep: z.string().max(5000).default(''),
+  /** Optional: where the deal already sits. Clamped to the workspace's stages; defaults to the first stage. */
+  stage: z.string().trim().max(150).optional(),
   draftReply: z.string().max(50_000).default(''),
   fitReasons: z.array(z.string().max(1000)).max(100).default([]),
   riskFlags: z.array(z.string().max(1000)).max(100).default([]),
@@ -69,10 +72,14 @@ export default async function ingestRoutes(app: FastifyInstance): Promise<void> 
       const workspace = await prisma.workspace.findUniqueOrThrow({ where: { id: wsId } })
       const settings = resolveSettings(workspace.settings)
 
+      const initialStage = normalizeStage(payload.stage, settings)
       const result = await upsertLeadByExternalId(prisma, wsId, settings, {
         ...payload,
-        initialStage: 'New',
-        createdDetail: `Ingested via webhook (${payload.source})`,
+        initialStage,
+        createdDetail:
+          initialStage === settings.stages[0]
+            ? `Ingested via webhook (${payload.source})`
+            : `Ingested via webhook (${payload.source}) · stage ${initialStage}`,
       })
       return reply.status(result.created ? 201 : 200).send({ id: result.lead.id, created: result.created })
     },

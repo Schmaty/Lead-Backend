@@ -379,6 +379,9 @@ async function main(): Promise<void> {
       fitReasons: json(d.reasons ?? []), riskFlags: json(d.risks ?? []), inferredFields: json(d.inf ?? []),
       stage: d.stage, ownerId: d.owner ? ownerIds[d.owner] : null, followUpDate,
       replySent: d.reply ?? false, lastTouchedAt: events[events.length - 1]!.at, notes: d.notes ?? '',
+      // Re-seeding always restores a fully visible demo, even if leads were
+      // previously soft-deleted in a scratch/testing session.
+      deletedAt: null,
     }
     const lead = await prisma.lead.upsert({
       where: { workspaceId_externalId: { workspaceId: workspace.id, externalId } },

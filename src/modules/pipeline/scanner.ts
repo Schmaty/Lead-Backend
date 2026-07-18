@@ -31,6 +31,7 @@ import {
   type MailboxConfig,
 } from './mailbox.js'
 import { classifyRelevance, createAnthropic, scoreEmail, type ConversationContext, type RelevanceVerdict, type ScoredLead } from './scorer.js'
+import { mapCrmStatusToStage } from './stages.js'
 
 /** Client sign-in path: value = Google refresh token, meta = { email, lastScanAt }. */
 export const GMAIL_OAUTH_KIND = 'GMAIL_OAUTH'
@@ -589,8 +590,12 @@ export async function runScan(
             riskFlags: scored.riskFlags,
             inferredFields: scored.inferredFields,
             threads: group.map((email) => asThread(email, 'in')),
-            initialStage: 'New',
-            createdDetail: `Scanned from inbox (${newest.from.address})`,
+            // Land the lead where the conversation actually is (create only).
+            initialStage: scored.pipelineStage,
+            createdDetail:
+              scored.pipelineStage === settings.stages[0]
+                ? `Scanned from inbox (${newest.from.address})`
+                : `Scanned from inbox (${newest.from.address}) · detected stage: ${scored.pipelineStage}`,
           },
           { threadMode: 'merge' },
         )
@@ -705,6 +710,11 @@ export async function runScan(
               const scored = await deps.scoreEmail(
                 credentials.anthropicApiKey, synthetic, settings, workspace.name, undefined, credentials.scorerModel,
               )
+              // The CRM knows where the deal sits — its Lead_Status is
+              // authoritative. Fall back to the AI's read only when the status
+              // is blank or doesn't map to a known stage.
+              const crmStage = mapCrmStatusToStage(open.status, settings)
+              const initialStage = crmStage ?? scored.pipelineStage
               const { lead } = await upsertLeadByExternalId(prisma, workspaceId, settings, {
                 externalId: synthetic.messageId,
                 receivedAt: startedAt,
@@ -727,8 +737,10 @@ export async function runScan(
                 riskFlags: scored.riskFlags,
                 inferredFields: scored.inferredFields,
                 threads: [],
-                initialStage: 'New',
-                createdDetail: `Imported from Zoho CRM (${open.record.name})`,
+                initialStage,
+                createdDetail: `Imported from Zoho CRM (${open.record.name})${
+                  open.status ? ` · status "${open.status}" → ${initialStage}` : ` · stage ${initialStage}`
+                }`,
               }, { threadMode: 'merge' })
               touchedLeadIds.add(lead.id)
               await upsertPerson(prisma, lead.id, { name: open.record.name, email, role: 'Reached out', seenAt: startedAt })

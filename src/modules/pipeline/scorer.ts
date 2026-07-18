@@ -4,6 +4,7 @@ import { zodOutputFormat } from '@anthropic-ai/sdk/helpers/zod'
 import { z } from 'zod/v4'
 import type { WorkspaceSettings } from '../../types/settings.js'
 import type { InboundEmail } from './mailbox.js'
+import { normalizeStage } from './stages.js'
 
 /** Model used for scoring. Opus-tier: lead quality drives real follow-up work. */
 export const SCORER_MODEL = 'claude-opus-4-8'
@@ -28,6 +29,11 @@ const scoredLeadSchema = z.object({
   estPayoutRaw: z.string().describe('Human-readable payout estimate with reasoning, e.g. "$6,000–12,000 — 40-seat workshop, budget mentioned"'),
   estWork: z.string().describe('Rough delivery effort, e.g. "~2 workshop days + prep"'),
   recommendedNextStep: z.string().describe('The single next action the team should take'),
+  pipelineStage: z
+    .string()
+    .describe(
+      'The pipeline stage this deal has ACTUALLY reached, judged from the evidence — one of the workspace stages, verbatim. Start at the first stage for a fresh first-touch inquiry with no reply yet; advance only on concrete evidence (a reply exchanged, a call/meeting held, needs qualified, a proposal/quote sent, a deal explicitly won or lost). Never advance on optimism, and never pick a won stage unless the text confirms a signed/agreed deal.',
+    ),
   draftReply: z.string().describe('A short, warm, specific reply draft the team could send. No placeholder brackets; sign off without a name.'),
   fitReasons: z.array(z.string()).describe('Short bullets for why this lead fits (empty if it does not)'),
   riskFlags: z.array(z.string()).describe('Short bullets for concerns or unknowns'),
@@ -56,10 +62,11 @@ function buildSystemPrompt(settings: WorkspaceSettings, workspaceName: string): 
     `You score inbound email inquiries for "${workspaceName}", a small business that tracks its sales leads in a CRM.`,
     'Read the email and produce a structured lead assessment. Judge fit from the perspective of the business receiving the email.',
     `The inquiry categories are, verbatim: ${settings.inquiryTypes.map((t) => `"${t}"`).join(', ')}. Pick exactly one.`,
+    `The pipeline stages, earliest → latest, are: ${settings.stages.map((s) => `"${s}"`).join(', ')}. For pipelineStage, pick the one that matches how far this deal has actually progressed, using the evidence in front of you — default to the first stage unless there is clear evidence of progress.`,
     'Scores are integers 0-10. Deal values are USD estimates for the full engagement; use 0/0 when the email gives no basis for a number.',
     'Anything you estimate without direct evidence in the email belongs in inferredFields.',
     'Mark relevant=false for anything that is not a genuine potential-client inquiry (newsletters, receipts, automated mail, spam, vendors selling TO the business). Still fill in the other fields as best you can.',
-    'When conversation history is provided, this is an ongoing exchange: assess the deal as it NOW stands (not just the latest email), update the summary to say where things stand, set recommendedNextStep to the next move in this conversation, and write draftReply as the next reply in-thread.',
+    'When conversation history is provided, this is an ongoing exchange: assess the deal as it NOW stands (not just the latest email), update the summary to say where things stand, set recommendedNextStep to the next move in this conversation, write draftReply as the next reply in-thread, and set pipelineStage from how far the whole exchange has advanced (a back-and-forth is past the first stage).',
   ].join('\n')
 }
 
@@ -135,6 +142,7 @@ export function normalizeScoredLead(raw: ScoredLead, settings: WorkspaceSettings
   return {
     ...raw,
     inquiryType,
+    pipelineStage: normalizeStage(raw.pipelineStage, settings),
     fitScore: clamp(raw.fitScore),
     urgencyScore: clamp(raw.urgencyScore),
     leadScore: clamp(raw.leadScore),

@@ -3,6 +3,7 @@ import type { FastifyInstance } from 'fastify'
 import type { InboundEmail, MailboxConfig } from '../src/modules/pipeline/mailbox.js'
 import { runScan, setScanDepsForTesting, type ScanDeps } from '../src/modules/pipeline/scanner.js'
 import { normalizeScoredLead, type ConversationContext, type RelevanceVerdict, type ScoredLead } from '../src/modules/pipeline/scorer.js'
+import { mapCrmStatusToStage, normalizeStage } from '../src/modules/pipeline/stages.js'
 import type { AmbientInsight, AmbientMeeting } from '../src/services/ambient.js'
 import { DEFAULT_SETTINGS } from '../src/types/settings.js'
 import { addMember, api, makeApp, resetDb, signup, testConfig, type Session } from './helpers.js'
@@ -57,6 +58,7 @@ const scoredFor: Record<string, ScoredLead> = {
     estPayoutRaw: '$6,000–12,000 — 40 seats, budget approved',
     estWork: '~2 workshop days + prep',
     recommendedNextStep: 'Offer a scoping call this week.',
+    pipelineStage: 'New',
     draftReply: 'Hi Dana — happy to help…',
     fitReasons: ['Budget approved', 'Named headcount'],
     riskFlags: [],
@@ -76,6 +78,7 @@ const scoredFor: Record<string, ScoredLead> = {
     estPayoutRaw: '',
     estWork: '',
     recommendedNextStep: 'Ignore.',
+    pipelineStage: 'New',
     draftReply: '',
     fitReasons: [],
     riskFlags: ['Bulk promotional mail'],
@@ -266,6 +269,29 @@ describe('runScan', () => {
     expect(result.imported).toBe(0)
     expect(result.errors).toHaveLength(1)
     expect(result.errors[0]).toContain('Breaks scoring')
+  })
+
+  it('creates a new lead at the stage the scorer detected', async () => {
+    const advanced = email({
+      messageId: '<advanced-1@mail.example>',
+      from: { name: 'Riya Sharma', address: 'riya@advanced.example' },
+      subject: 'Re: proposal follow-up',
+      text: 'Thanks for the proposal — reviewing internally, will confirm the 30 seats soon.',
+    })
+    scoredFor[advanced.messageId] = {
+      ...scoredFor[hotEmail.messageId]!,
+      name: 'Riya Sharma',
+      org: 'Advanced Co',
+      pipelineStage: 'Qualified',
+    }
+    const result = await runScan(app.prisma, testConfig(), owner.workspace.id, fakeDeps([advanced]))
+    expect(result.imported).toBe(1)
+
+    const list = await api(app, owner, { method: 'GET', url: '/api/v1/leads?pageSize=50' })
+    const lead = list.json().items.find((l: { externalId: string }) => l.externalId === advanced.messageId)
+    expect(lead.stage).toBe('Qualified')
+    const detail = await api(app, owner, { method: 'GET', url: `/api/v1/leads/${lead.id}` })
+    expect(detail.json().timeline[0].detail).toContain('detected stage: Qualified')
   })
 })
 
@@ -613,5 +639,43 @@ describe('normalizeScoredLead', () => {
     expect(out.dealValueHigh).toBe(9000)
     expect(out.leadScore).toBe(10)
     expect(out.fitScore).toBe(0)
+  })
+
+  it('clamps an out-of-list pipelineStage to a configured stage', () => {
+    expect(normalizeScoredLead({ ...base, pipelineStage: 'Proposal sent' }, DEFAULT_SETTINGS).pipelineStage).toBe('Proposal sent')
+    // Case-insensitive and keyword fallbacks land on real stages.
+    expect(normalizeScoredLead({ ...base, pipelineStage: 'proposal sent' }, DEFAULT_SETTINGS).pipelineStage).toBe('Proposal sent')
+    expect(normalizeScoredLead({ ...base, pipelineStage: 'in negotiation' }, DEFAULT_SETTINGS).pipelineStage).toBe('Proposal sent')
+    // Unknown / empty falls back to the first stage, never off-list.
+    expect(normalizeScoredLead({ ...base, pipelineStage: 'Wishlist' }, DEFAULT_SETTINGS).pipelineStage).toBe('New')
+    expect(normalizeScoredLead({ ...base, pipelineStage: '' }, DEFAULT_SETTINGS).pipelineStage).toBe('New')
+  })
+})
+
+describe('pipeline stage categorization', () => {
+  it('normalizeStage clamps free text to the workspace stages', () => {
+    expect(normalizeStage('Qualified', DEFAULT_SETTINGS)).toBe('Qualified')
+    expect(normalizeStage('qualified', DEFAULT_SETTINGS)).toBe('Qualified')
+    expect(normalizeStage('  Closed won  ', DEFAULT_SETTINGS)).toBe('Closed won')
+    expect(normalizeStage('made contact', DEFAULT_SETTINGS)).toBe('Contacted')
+    expect(normalizeStage('not a fit', DEFAULT_SETTINGS)).toBe('Not fit')
+    expect(normalizeStage(undefined, DEFAULT_SETTINGS)).toBe('New')
+    expect(normalizeStage('nonsense', DEFAULT_SETTINGS)).toBe('New')
+  })
+
+  it('maps Zoho Lead_Status to the stage the deal has reached', () => {
+    expect(mapCrmStatusToStage('Not Contacted', DEFAULT_SETTINGS)).toBe('New')
+    expect(mapCrmStatusToStage('Attempted to Contact', DEFAULT_SETTINGS)).toBe('Contacted')
+    expect(mapCrmStatusToStage('Contacted', DEFAULT_SETTINGS)).toBe('Contacted')
+    expect(mapCrmStatusToStage('Contact in Future', DEFAULT_SETTINGS)).toBe('Contacted')
+    expect(mapCrmStatusToStage('Pre-Qualified', DEFAULT_SETTINGS)).toBe('Qualified')
+    expect(mapCrmStatusToStage('Qualified', DEFAULT_SETTINGS)).toBe('Qualified')
+    // Negatives must beat their positive substring.
+    expect(mapCrmStatusToStage('Not Qualified', DEFAULT_SETTINGS)).toBe('Not fit')
+    expect(mapCrmStatusToStage('Junk Lead', DEFAULT_SETTINGS)).toBe('Not fit')
+    expect(mapCrmStatusToStage('Lost Lead', DEFAULT_SETTINGS)).toBe('Closed lost')
+    // Blank / unknown → null so the caller falls back to the AI's read.
+    expect(mapCrmStatusToStage('', DEFAULT_SETTINGS)).toBeNull()
+    expect(mapCrmStatusToStage('Some Custom Status', DEFAULT_SETTINGS)).toBeNull()
   })
 })

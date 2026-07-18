@@ -55,6 +55,7 @@ const scoredJordan: ScoredLead = {
   estPayoutRaw: '$4–8k',
   estWork: '~1 day',
   recommendedNextStep: 'Offer a scoping call.',
+  pipelineStage: 'New',
   draftReply: 'Hi Jordan…',
   fitReasons: ['Core offering'],
   riskFlags: [],
