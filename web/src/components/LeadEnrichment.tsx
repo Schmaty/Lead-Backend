@@ -3,7 +3,7 @@ import { api } from '../api'
 import { fmtDate } from '../compute'
 import { useDesk } from '../store'
 import { A, C, mono, upLabel } from '../styles'
-import type { CrmLookup, Lead, Meeting, Person } from '../types'
+import type { CrmLookup, CrmPrefill, Lead, Meeting, Person } from '../types'
 
 const box: CSSProperties = { border: `1px solid ${C.line}`, borderRadius: 10, padding: '12px 14px' }
 
@@ -19,6 +19,7 @@ export default function LeadEnrichment({ lead }: { lead: Lead }): ReactNode {
   const [crm, setCrm] = useState<CrmLookup | null>(null)
   const [crmBusy, setCrmBusy] = useState(false)
   const [addOpen, setAddOpen] = useState(false)
+  const [form, setForm] = useState<CrmPrefill | null>(null)
   const [pushBusy, setPushBusy] = useState(false)
   const [scopeBlocked, setScopeBlocked] = useState(false)
 
@@ -55,26 +56,40 @@ export default function LeadEnrichment({ lead }: { lead: Lead }): ReactNode {
     }
   }
 
-  // Everything the new-CRM-record form is prefilled with.
-  const prefill = detail ?? lead
-  const dealValue = prefill.estPayoutRaw || (prefill.dealValueHigh ? `$${prefill.dealValueLow.toLocaleString()}–$${prefill.dealValueHigh.toLocaleString()}` : '—')
-  const prefillPhone = (detail?.people ?? []).find((p) => p.phone)?.phone ?? ''
-  const prefillRows: Array<[string, string]> = [
-    ['Name', prefill.name || '—'],
-    ['Email', prefill.email || '—'],
-    ['Company', prefill.org || '—'],
-    ['Phone', prefillPhone || '—'],
-    ['Est. value', dealValue],
-    ['Inquiry', prefill.inquiryType || '—'],
-    ['Summary', prefill.summary || '—'],
-  ]
-
-  const openZohoForm = (): void => {
-    window.open(crm?.createUrl ?? 'https://crm.zoho.com/crm/tab/Leads/create', '_blank', 'noopener')
+  // Prefill the popup from the lead (mirrors the backend's buildCrmPrefill).
+  const computePrefill = (l: Lead): CrmPrefill => {
+    const [first, ...rest] = (l.name || '').trim().split(/\s+/).filter(Boolean)
+    const phone = (l.people ?? []).find((p) => p.phone)?.phone ?? ''
+    const value = l.estPayoutRaw || (l.dealValueHigh ? `$${l.dealValueLow.toLocaleString()}–$${l.dealValueHigh.toLocaleString()}` : '')
+    const description = [
+      l.summary,
+      value ? `Estimated value: ${value}` : '',
+      l.inquiryType ? `Inquiry: ${l.inquiryType}` : '',
+      `Lead score: ${l.leadScore}/10 · stage: ${l.stage}`,
+      l.recommendedNextStep ? `Next step: ${l.recommendedNextStep}` : '',
+      'Added from Leadline.',
+    ].filter(Boolean).join('\n')
+    return {
+      firstName: rest.length ? first ?? '' : '',
+      lastName: rest.length ? rest.join(' ') : first ?? '',
+      email: l.email, company: l.org, phone, title: '', leadSource: 'Leadline', description,
+    }
   }
 
+  const openAdd = (): void => {
+    setForm(crm?.prefill ?? computePrefill(detail ?? lead))
+    setScopeBlocked(false)
+    setAddOpen(true)
+  }
+  const setField = (key: keyof CrmPrefill, value: string): void => setForm((f) => (f ? { ...f, [key]: value } : f))
+
   const copyDetails = (): void => {
-    const text = prefillRows.map(([k, v]) => `${k}: ${v}`).join('\n')
+    if (!form) return
+    const text = [
+      `First name: ${form.firstName}`, `Last name: ${form.lastName}`, `Company: ${form.company}`,
+      `Title: ${form.title}`, `Email: ${form.email}`, `Phone: ${form.phone}`,
+      `Lead source: ${form.leadSource}`, `Description: ${form.description}`,
+    ].join('\n')
     navigator.clipboard?.writeText(text).then(
       () => desk.toast('Lead details copied — paste into Zoho'),
       () => desk.toast('Could not copy'),
@@ -82,18 +97,19 @@ export default function LeadEnrichment({ lead }: { lead: Lead }): ReactNode {
   }
 
   const pushToCrm = async (): Promise<void> => {
+    if (!form) return
     setPushBusy(true)
     try {
-      const res = await api.crmPush(lead.id)
+      const res = await api.crmPush(lead.id, form)
       if (res.ok && res.url) {
         desk.toast('Added to Zoho CRM ✓')
         window.open(res.url, '_blank', 'noopener')
         // Reflect the new record immediately.
-        setCrm((c) => (c ? { ...c, records: [...c.records, { module: 'Leads', id: res.id!, name: prefill.name, company: prefill.org, email: prefill.email, phone: prefillPhone, url: res.url!, matchVia: 'email' }] } : c))
+        setCrm((c) => (c ? { ...c, records: [...c.records, { module: 'Leads', id: res.id!, name: [form.firstName, form.lastName].filter(Boolean).join(' '), company: form.company, email: form.email, phone: form.phone, url: res.url!, matchVia: 'email' }] } : c))
         setAddOpen(false)
       } else if (res.scopeError) {
         setScopeBlocked(true)
-        desk.toast('Zoho is connected read-only — use the prefilled form below')
+        desk.toast('Zoho is connected read-only — copy the details or reconnect with write access')
       } else {
         desk.toast(res.error || 'Could not add to Zoho')
       }
@@ -204,55 +220,107 @@ export default function LeadEnrichment({ lead }: { lead: Lead }): ReactNode {
             ))}
           </div>
         ) : (
-          // No match — offer to add it, prefilled.
-          <div>
-            <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
-              <span style={{ fontSize: 12.5, color: C.faint, flex: 1, minWidth: 140 }}>No matching record in Zoho yet.</span>
-              <button
-                onClick={() => setAddOpen((o) => !o)}
-                style={{ fontSize: 12.5, fontWeight: 700, color: '#fff', background: A, border: 'none', borderRadius: 8, padding: '8px 14px', cursor: 'pointer', whiteSpace: 'nowrap' }}
-              >
-                {addOpen ? 'Close' : 'Add to CRM'}
-              </button>
-            </div>
-            {addOpen && (
-              <div style={{ ...box, marginTop: 10 }}>
-                <div style={{ fontSize: 11, fontWeight: 700, letterSpacing: '.05em', textTransform: 'uppercase', color: C.faint, marginBottom: 8 }}>New Zoho lead — prefilled</div>
-                <div style={{ display: 'flex', flexDirection: 'column', gap: 5 }}>
-                  {prefillRows.map(([k, v]) => (
-                    <div key={k} style={{ display: 'flex', gap: 8, fontSize: 12.5, lineHeight: 1.4 }}>
-                      <span style={{ color: C.faint, minWidth: 78, flex: '0 0 auto' }}>{k}</span>
-                      <span style={{ color: C.sub, minWidth: 0, wordBreak: 'break-word' }}>{v}</span>
-                    </div>
-                  ))}
-                </div>
-                {scopeBlocked && (
-                  <div style={{ fontSize: 11.5, color: C.warn, background: 'rgba(181,71,8,.08)', borderRadius: 7, padding: '7px 9px', marginTop: 9 }}>
-                    Your Zoho connection is read-only, so I can&apos;t create the record directly. Open the prefilled Zoho form and paste the details, or ask your developer to reconnect Zoho with lead-create permission.
-                  </div>
-                )}
-                <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginTop: 11, flexWrap: 'wrap' }}>
-                  {!scopeBlocked && (
-                    <button
-                      onClick={() => void pushToCrm()}
-                      disabled={pushBusy}
-                      style={{ fontSize: 12.5, fontWeight: 700, color: '#fff', background: A, border: 'none', borderRadius: 8, padding: '8px 14px', cursor: pushBusy ? 'default' : 'pointer', opacity: pushBusy ? 0.6 : 1 }}
-                    >
-                      {pushBusy ? 'Adding…' : 'Create in Zoho'}
-                    </button>
-                  )}
-                  <button onClick={openZohoForm} style={{ fontSize: 12.5, fontWeight: 600, color: A, background: 'rgba(18,67,59,.07)', border: `1px solid rgba(18,67,59,.2)`, borderRadius: 8, padding: '8px 14px', cursor: 'pointer' }}>
-                    Open Zoho form ↗
-                  </button>
-                  <button onClick={copyDetails} style={{ fontSize: 12.5, fontWeight: 600, color: C.sub, background: 'none', border: `1px solid ${C.line}`, borderRadius: 8, padding: '8px 14px', cursor: 'pointer' }}>
-                    Copy details
-                  </button>
-                </div>
-              </div>
-            )}
+          // No match — open the editable popup to add it.
+          <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
+            <span style={{ fontSize: 12.5, color: C.faint, flex: 1, minWidth: 140 }}>No matching record in Zoho yet.</span>
+            <button
+              onClick={openAdd}
+              style={{ fontSize: 12.5, fontWeight: 700, color: '#fff', background: A, border: 'none', borderRadius: 8, padding: '8px 14px', cursor: 'pointer', whiteSpace: 'nowrap' }}
+            >
+              Add to CRM
+            </button>
           </div>
         )}
       </div>
+
+      {addOpen && form && (
+        <AddToCrmPopup
+          form={form}
+          setField={setField}
+          scopeBlocked={scopeBlocked}
+          busy={pushBusy}
+          onCreate={() => void pushToCrm()}
+          onCopy={copyDetails}
+          onClose={() => setAddOpen(false)}
+        />
+      )}
     </>
+  )
+}
+
+const fieldLabel: CSSProperties = { fontSize: 10.5, fontWeight: 700, letterSpacing: '.05em', textTransform: 'uppercase', color: C.faint, marginBottom: 4, display: 'block' }
+const fieldInput: CSSProperties = { width: '100%', padding: '8px 10px', border: `1px solid ${C.border2}`, borderRadius: 7, fontSize: 13, background: C.bg2, color: C.body, boxSizing: 'border-box' }
+
+/** One text field in the popup. Module-scope so typing never loses focus. */
+function CrmField({ form, setField, k, label, wide }: { form: CrmPrefill; setField: (key: keyof CrmPrefill, value: string) => void; k: keyof CrmPrefill; label: string; wide?: boolean }): ReactNode {
+  return (
+    <div style={{ gridColumn: wide ? '1 / -1' : undefined }}>
+      <label style={fieldLabel}>{label}</label>
+      <input value={form[k]} onChange={(e) => setField(k, e.target.value)} style={fieldInput} />
+    </div>
+  )
+}
+
+/** The editable "new Zoho lead" popup — prefilled Zoho fields you can tweak, then push via the API. */
+function AddToCrmPopup({
+  form, setField, scopeBlocked, busy, onCreate, onCopy, onClose,
+}: {
+  form: CrmPrefill
+  setField: (key: keyof CrmPrefill, value: string) => void
+  scopeBlocked: boolean
+  busy: boolean
+  onCreate: () => void
+  onCopy: () => void
+  onClose: () => void
+}): ReactNode {
+  return (
+    <div
+      onClick={onClose}
+      style={{ position: 'fixed', inset: 0, background: 'rgba(20,30,28,.45)', zIndex: 60, display: 'flex', alignItems: 'flex-start', justifyContent: 'center', padding: '6vh 16px', overflowY: 'auto' }}
+    >
+      <div
+        onClick={(e) => e.stopPropagation()}
+        style={{ width: 'min(560px, 100%)', background: C.bg, borderRadius: 14, boxShadow: '0 24px 60px rgba(0,0,0,.28)', padding: 20 }}
+      >
+        <div style={{ display: 'flex', alignItems: 'baseline', justifyContent: 'space-between', gap: 10, marginBottom: 4 }}>
+          <div style={{ fontSize: 16, fontWeight: 700 }}>Add to Zoho CRM</div>
+          <button onClick={onClose} style={{ background: 'none', border: 'none', color: C.faint, cursor: 'pointer', fontSize: 13 }}>Cancel</button>
+        </div>
+        <div style={{ fontSize: 12, color: C.faint, marginBottom: 16 }}>New lead — prefilled from this lead. Edit anything, then create it in Zoho.</div>
+
+        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 }}>
+          <CrmField form={form} setField={setField} k="firstName" label="First name" />
+          <CrmField form={form} setField={setField} k="lastName" label="Last name" />
+          <CrmField form={form} setField={setField} k="company" label="Company" />
+          <CrmField form={form} setField={setField} k="title" label="Title" />
+          <CrmField form={form} setField={setField} k="email" label="Email" />
+          <CrmField form={form} setField={setField} k="phone" label="Phone" />
+          <CrmField form={form} setField={setField} k="leadSource" label="Lead source" wide />
+          <div style={{ gridColumn: '1 / -1' }}>
+            <label style={fieldLabel}>Description</label>
+            <textarea value={form.description} onChange={(e) => setField('description', e.target.value)} rows={5} style={{ ...fieldInput, resize: 'vertical', lineHeight: 1.5, fontFamily: 'inherit' }} />
+          </div>
+        </div>
+
+        {scopeBlocked && (
+          <div style={{ fontSize: 12, color: C.warn, background: 'rgba(181,71,8,.08)', borderRadius: 8, padding: '9px 11px', marginTop: 14 }}>
+            Your Zoho connection is read-only, so Leadline can&apos;t create the record directly. Copy the details and paste them into Zoho, or ask your developer to reconnect Zoho with lead-create permission.
+          </div>
+        )}
+
+        <div style={{ display: 'flex', alignItems: 'center', gap: 9, marginTop: 18, flexWrap: 'wrap' }}>
+          <button
+            onClick={onCreate}
+            disabled={busy}
+            style={{ fontSize: 13, fontWeight: 700, color: '#fff', background: A, border: 'none', borderRadius: 8, padding: '9px 16px', cursor: busy ? 'default' : 'pointer', opacity: busy ? 0.6 : 1 }}
+          >
+            {busy ? 'Creating…' : 'Create in Zoho'}
+          </button>
+          <button onClick={onCopy} style={{ fontSize: 13, fontWeight: 600, color: C.sub, background: 'none', border: `1px solid ${C.line}`, borderRadius: 8, padding: '9px 16px', cursor: 'pointer' }}>
+            Copy details
+          </button>
+        </div>
+      </div>
+    </div>
   )
 }

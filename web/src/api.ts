@@ -3,6 +3,7 @@ import type {
   Aggregates,
   CredentialRow,
   CrmLookup,
+  CrmPrefill,
   CrmPushResult,
   Lead,
   Role,
@@ -196,6 +197,7 @@ export const api = {
   deleteLead: (id: string) => request<{ ok: boolean }>(`/leads/${id}`, { method: 'DELETE' }),
   /** Zoho CRM records matched to this lead (read-only; push is coming soon). */
   leadCrm: (id: string) => request<CrmLookup>(`/leads/${id}/crm`),
-  /** Push a lead into Zoho as a new record (needs a write-scoped Zoho token). */
-  crmPush: (id: string) => request<CrmPushResult>(`/leads/${id}/crm/push`, { method: 'POST' }),
+  /** Push a lead into Zoho as a new record with the (edited) popup fields. */
+  crmPush: (id: string, fields: CrmPrefill) =>
+    request<CrmPushResult>(`/leads/${id}/crm/push`, { method: 'POST', body: JSON.stringify(fields) }),
 }

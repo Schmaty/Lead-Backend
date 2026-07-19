@@ -227,6 +227,8 @@ export interface CrmCreateFields {
   email: string
   company: string
   phone: string
+  title: string
+  leadSource: string
   description: string
 }
 
@@ -250,11 +252,12 @@ export async function createCrmLead(config: ZohoConfig, fields: CrmCreateFields)
   const record: Record<string, string> = {
     Last_Name: fields.lastName || fields.firstName || fields.email || 'Unknown',
     Company: fields.company || 'Unknown',
-    Lead_Source: 'Leadline',
+    Lead_Source: fields.leadSource || 'Leadline',
   }
   if (fields.firstName) record.First_Name = fields.firstName
   if (fields.email) record.Email = fields.email
   if (fields.phone) record.Phone = fields.phone
+  if (fields.title) record.Designation = fields.title
   if (fields.description) record.Description = fields.description
 
   const { status, json } = await deps.fetchJson(`${config.apiDomain}/crm/v8/Leads`, {

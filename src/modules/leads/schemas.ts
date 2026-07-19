@@ -132,3 +132,19 @@ export const patchLeadSchema = z.object({
 })
 
 export type PatchLeadInput = z.infer<typeof patchLeadSchema>
+
+/** The (possibly edited) Zoho lead fields sent from the "Add to CRM" popup. */
+export const crmPushSchema = z
+  .object({
+    firstName: z.string().trim().max(120),
+    lastName: z.string().trim().max(120),
+    email: z.string().trim().max(200),
+    company: z.string().trim().max(200),
+    phone: z.string().trim().max(60),
+    title: z.string().trim().max(120),
+    leadSource: z.string().trim().max(120),
+    description: z.string().max(20_000),
+  })
+  .partial()
+
+export type CrmPushInput = z.infer<typeof crmPushSchema>

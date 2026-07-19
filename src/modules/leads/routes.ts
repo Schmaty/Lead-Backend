@@ -8,17 +8,47 @@ import { applyComputed, computeExpectedValue } from '../../services/leadCompute.
 import { getPlatformAnthropicKey, getZohoConfig } from '../../services/platformCredentials.js'
 import { syncLeadCrm } from '../../services/crmSync.js'
 import { createAnthropic } from '../../modules/pipeline/scorer.js'
-import { createCrmLead, crmCreateLeadUrl } from '../../services/zoho.js'
+import { createCrmLead, crmCreateLeadUrl, type CrmCreateFields } from '../../services/zoho.js'
 import { resolveSettings, type WorkspaceSettings } from '../../types/settings.js'
 import { buildLeadWhere, computeAggregates } from './query.js'
 import {
   createLeadSchema,
+  crmPushSchema,
   listLeadsQuerySchema,
   patchLeadSchema,
   SAFE_PATCH_FIELDS,
   type ListLeadsQuery,
 } from './schemas.js'
 import { serializeLead } from './serialize.js'
+
+/** Prefill the "Add to CRM" popup from the lead — the same defaults the push uses. */
+function buildCrmPrefill(lead: {
+  name: string; email: string; org: string; summary: string; estPayoutRaw: string
+  dealValueLow: number; dealValueHigh: number; inquiryType: string; leadScore: number
+  stage: string; recommendedNextStep: string; people: Array<{ phone: string }>
+}): CrmCreateFields {
+  const [first, ...rest] = (lead.name || '').trim().split(/\s+/).filter(Boolean)
+  const phone = lead.people.find((p) => p.phone)?.phone ?? ''
+  const value = lead.estPayoutRaw || (lead.dealValueHigh ? `$${lead.dealValueLow}–${lead.dealValueHigh}` : '')
+  const description = [
+    lead.summary,
+    value ? `Estimated value: ${value}` : '',
+    lead.inquiryType ? `Inquiry: ${lead.inquiryType}` : '',
+    `Lead score: ${lead.leadScore}/10 · stage: ${lead.stage}`,
+    lead.recommendedNextStep ? `Next step: ${lead.recommendedNextStep}` : '',
+    'Added from Leadline.',
+  ].filter(Boolean).join('\n')
+  return {
+    firstName: rest.length ? first ?? '' : '',
+    lastName: rest.length ? rest.join(' ') : first ?? '',
+    email: lead.email,
+    company: lead.org,
+    phone,
+    title: '',
+    leadSource: 'Leadline',
+    description,
+  }
+}
 
 const CSV_EXPORT_LIMIT = 10_000
 
@@ -153,19 +183,20 @@ export default async function leadsRoutes(app: FastifyInstance): Promise<void> {
     const { id } = request.params as { id: string }
     const lead = await prisma.lead.findFirst({
       where: { id, workspaceId: wsId, deletedAt: null },
-      include: { people: { select: { email: true } } },
+      include: { people: { select: { email: true, phone: true } } },
     })
     if (!lead) throw new AppError(404, 'Lead not found')
+    const prefill = buildCrmPrefill(lead)
     const zoho = await getZohoConfig(prisma, config)
     if (!zoho) {
-      return { available: false, records: [], checkedAt: null, createUrl: null }
+      return { available: false, records: [], checkedAt: null, createUrl: null, prefill }
     }
     try {
       // Same pull the scan runs: caches on the lead, logs new matches,
       // backfills org + person phones. Exact email first, then AI keywords.
       const apiKey = await getPlatformAnthropicKey(prisma, config)
       const { records } = await syncLeadCrm(prisma, zoho, lead.id, apiKey ? { anthropic: createAnthropic(apiKey) } : {})
-      return { available: true, records, checkedAt: new Date(), createUrl: crmCreateLeadUrl() }
+      return { available: true, records, checkedAt: new Date(), createUrl: crmCreateLeadUrl(), prefill }
     } catch (err) {
       app.log.error({ err, leadId: id }, 'zoho lookup failed')
       throw new AppError(502, 'CRM lookup failed — check the Zoho connection')
@@ -189,26 +220,20 @@ export default async function leadsRoutes(app: FastifyInstance): Promise<void> {
     const zoho = await getZohoConfig(prisma, config)
     if (!zoho) throw new AppError(400, 'Zoho CRM isn’t connected — add it under Settings → Platform')
 
-    const [first, ...rest] = (lead.name || '').trim().split(/\s+/).filter(Boolean)
-    const phone = lead.people.find((p) => p.phone)?.phone ?? ''
-    const value = lead.estPayoutRaw || (lead.dealValueHigh ? `$${lead.dealValueLow}–${lead.dealValueHigh}` : '')
-    const description = [
-      lead.summary,
-      value ? `Estimated value: ${value}` : '',
-      lead.inquiryType ? `Inquiry: ${lead.inquiryType}` : '',
-      `Lead score: ${lead.leadScore}/10 · stage: ${lead.stage}`,
-      lead.recommendedNextStep ? `Next step: ${lead.recommendedNextStep}` : '',
-      'Added from Leadline.',
-    ].filter(Boolean).join('\n')
-
-    const result = await createCrmLead(zoho, {
-      firstName: rest.length ? first ?? '' : '',
-      lastName: rest.length ? rest.join(' ') : first ?? '',
-      email: lead.email,
-      company: lead.org,
-      phone,
-      description,
-    })
+    // Start from the lead's prefill, then apply whatever the user edited in the popup.
+    const edits = crmPushSchema.parse(request.body ?? {})
+    const base = buildCrmPrefill(lead)
+    const fields: CrmCreateFields = {
+      firstName: edits.firstName ?? base.firstName,
+      lastName: edits.lastName ?? base.lastName,
+      email: edits.email ?? base.email,
+      company: edits.company ?? base.company,
+      phone: edits.phone ?? base.phone,
+      title: edits.title ?? base.title,
+      leadSource: edits.leadSource ?? base.leadSource,
+      description: edits.description ?? base.description,
+    }
+    const result = await createCrmLead(zoho, fields)
 
     if (!result.ok) {
       return reply.status(result.scopeError ? 200 : 502).send({
@@ -222,10 +247,10 @@ export default async function leadsRoutes(app: FastifyInstance): Promise<void> {
     const record = {
       module: 'Leads' as const,
       id: result.id,
-      name: lead.name,
-      company: lead.org,
-      email: lead.email,
-      phone,
+      name: [fields.firstName, fields.lastName].filter(Boolean).join(' ') || lead.name,
+      company: fields.company,
+      email: fields.email,
+      phone: fields.phone,
       url: result.url,
       matchVia: 'email' as const,
     }

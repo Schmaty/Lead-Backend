@@ -74,12 +74,26 @@ export interface CrmRecord {
   matchConfidence?: number
 }
 
+/** The Zoho lead fields the "Add to CRM" popup shows — editable, then pushed. */
+export interface CrmPrefill {
+  firstName: string
+  lastName: string
+  email: string
+  company: string
+  phone: string
+  title: string
+  leadSource: string
+  description: string
+}
+
 export interface CrmLookup {
   available: boolean
   records: CrmRecord[]
   checkedAt: string | null
-  /** Zoho's new-lead form URL — the prefill fallback when a record doesn't exist yet. */
+  /** Zoho's new-lead form URL — the manual fallback when the token is read-only. */
   createUrl: string | null
+  /** Prefilled Zoho lead fields for the "Add to CRM" popup. */
+  prefill?: CrmPrefill
 }
 
 export interface CrmPushResult {
